@@ -1,11 +1,11 @@
 # SurveyPilot 🤖
 
-An automated hybrid agent for Android survey apps. SurveyPilot dynamically switches between **Native UI Automator** mode and **CDP (Chrome DevTools Protocol) DOM Injection** mode to intelligently complete surveys on your Android device.
+An automated hybrid agent for Android survey apps. SurveyPilot dynamically switches between **Native UI Automator** mode and **CDP (Chrome DevTools Protocol) DOM Injection** mode to interact with an Android phone or BlueStacks instance.
 
 ## Features
 
 - 🔀 **Hybrid Mode** — Automatically detects whether the current screen is a native Android UI or a WebView and switches strategy accordingly.
-- 🧠 **AI-Powered** — Uses Claude (Anthropic) to analyze the screen and decide what to do next.
+- 🧠 **AI-Powered** — Uses OpenRouter with NVIDIA Nemotron 3 Ultra (free) to analyze the screen and decide what to do next.
 - 🚫 **Auto-Skip** — Detects screen-outs, captchas, complex sliders, and loading-stuck surveys and skips them automatically.
 - 📊 **Live Dashboard** — Real-time logs, live DOM/XML context viewer, and session stats.
 - 💰 **Cost Control** — Set a maximum API spend limit and a survey completion goal.
@@ -18,10 +18,10 @@ An automated hybrid agent for Android survey apps. SurveyPilot dynamically switc
 ## Requirements
 
 - **Windows** (uses `.exe` paths for ADB and Frida)
-- [scrcpy](https://github.com/Genymobile/scrcpy) (includes `adb.exe`)
-- [Frida](https://frida.re/) + `frida-server` pushed to your device
-- A rooted Android device (for Frida injection)
-- An [Anthropic API key](https://console.anthropic.com/)
+- Android Debug Bridge (ADB), either from [scrcpy](https://github.com/Genymobile/scrcpy) or BlueStacks (`HD-Adb.exe`)
+- A physical Android device or BlueStacks 5 instance with ADB enabled
+- [Frida](https://frida.re/) + `frida-server` in `/data/local/tmp` and root access for WebView injection
+- An [OpenRouter API key](https://openrouter.ai/keys)
 - Node.js + pnpm
 
 ## Setup
@@ -37,38 +37,38 @@ An automated hybrid agent for Android survey apps. SurveyPilot dynamically switc
    pnpm install
    ```
 
-3. **Configure paths in `vite.config.ts`**
+3. **Configure ADB and Frida**
 
-   Open `vite.config.ts` and update these two constants at the top to match your local setup:
-   ```ts
-   const ADB = 'C:\\path\\to\\scrcpy\\adb.exe';
-   const FRIDA = 'C:\\path\\to\\frida.exe';
-   ```
+   Copy `.env.example` to `.env` and set `OPENROUTER_API_KEY`, `ADB_PATH`, and `FRIDA_PATH`. The default model is `nvidia/nemotron-3-ultra-550b-a55b:free`; `ADB_SERIAL` is optional. Leave it blank to choose a connected device in the dashboard. The `.env` file is ignored by Git.
 
-4. **Run the dev server**
+4. **Connect BlueStacks (or a phone)**
+
+   In BlueStacks 5, enable **Settings → Advanced → Android Debug Bridge** and save. In SurveyPilot, enter the BlueStacks local ADB address (usually `127.0.0.1:5555`, or the port configured for that instance), select **Connect BlueStacks**, then choose the connected device from the device list. A phone connected over USB remains selectable there too.
+
+5. **Run the dev server**
    ```bash
    pnpm dev
    ```
 
-5. **Open the app** at `http://localhost:8080` and fill in:
-   - Your Anthropic API key
-   - The path to your scrcpy folder
+6. **Open the app** at `http://localhost:8080` and fill in:
    - Choose your target survey app
    - Set a cost limit and survey goal
 
 ## How It Works
 
-1. The agent launches the target app via ADB.
+1. The dashboard selects one online ADB target and launches the target app there.
 2. It dumps the UI XML to check whether a WebView is present.
 3. **NATIVE mode**: Sends ADB tap commands based on UI element bounds.
 4. **WEB mode**: Connects via CDP to the WebView and injects JavaScript.
-5. Claude analyzes each screen and returns a structured action (tap, evaluate, wait, or done).
+5. The local Vite server sends screen context to OpenRouter; Nemotron returns a structured action (tap, evaluate, wait, or done).
 6. The loop continues until the survey goal is reached or the cost limit is hit.
 
 ## Security Notes
 
-- Your Anthropic API key is stored in `localStorage` only — it is never committed to the repo.
-- ADB and Frida paths are configured in `vite.config.ts` which you should keep out of public forks if your paths reveal sensitive info.
+- The OpenRouter key stays in the local `.env` file and is sent from the Vite server, not stored in browser storage.
+- Screen XML, WebView page text/HTML, and the configured goal are sent to OpenRouter for model requests. The free NVIDIA endpoint may log and use request data to improve its products; do not use it with information you do not want sent to that service.
+- ADB and Frida paths can be configured in `.env`; do not commit real local paths or keys.
+- Frida/root is needed for the current WebView debugging injection path. Native UI automation uses ADB without Frida.
 - This tool is intended for personal use on your own device.
 
 ## License

@@ -1,6 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import Anthropic from '@anthropic-ai/sdk';
-import { Bot, Play, Square, Loader2, Target, Activity, Code2, FolderOpen, DollarSign, CheckCircle, XCircle, AlertTriangle, Smartphone, Copy } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Bot, Play, Square, Loader2, Target, Activity, Code2, DollarSign, CheckCircle, XCircle, AlertTriangle, Smartphone, Copy } from 'lucide-react';
 import { showSuccess, showError } from '@/utils/toast';
 import { cn } from '@/lib/utils';
 
@@ -11,15 +10,26 @@ interface LogEntry {
   message: string;
 }
 
+interface AdbDevice {
+  serial: string;
+  state: string;
+  details: string;
+}
+
 const APPS = [
   { name: 'AttaPoll', package: 'com.requapp.requ' },
   { name: '5Surveys', package: 'com.fivesurveys.mobile' },
 ];
 
 export const AndroidAgent = () => {
-  const [apiKey, setApiKey] = useState('');
-  const [scrcpyDir, setScrcpyDir] = useState('C:\\path\\to\\scrcpy');
   const [appPackage, setAppPackage] = useState(APPS[0].package);
+  const [adbDevices, setAdbDevices] = useState<AdbDevice[]>([]);
+  const [selectedDevice, setSelectedDevice] = useState('');
+  const [bluestacksAddress, setBluestacksAddress] = useState('127.0.0.1:5555');
+  const [deviceStatus, setDeviceStatus] = useState('Looking for Android devices...');
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [openRouterModel, setOpenRouterModel] = useState('nvidia/nemotron-3-ultra-550b-a55b:free');
+  const [openRouterConfigured, setOpenRouterConfigured] = useState(false);
   const [goal, setGoal] = useState('Complete as many surveys as possible for maximum profit. After each survey (completed or screened out), return to the survey list and start the next best one immediately. Never stop unless there are no surveys available.');
   const [maxCost, setMaxCost] = useState('0.50');
   const [surveyGoal, setSurveyGoal] = useState('5');
@@ -36,10 +46,6 @@ export const AndroidAgent = () => {
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const savedKey = localStorage.getItem('anthropic_api_key');
-    if (savedKey) setApiKey(savedKey);
-    const savedDir = localStorage.getItem('scrcpy_directory');
-    if (savedDir) setScrcpyDir(savedDir);
     const savedPkg = localStorage.getItem('agent_package');
     if (savedPkg) setAppPackage(savedPkg);
   }, []);
@@ -56,6 +62,77 @@ export const AndroidAgent = () => {
       message
     }]);
   };
+
+  const refreshAdbDevices = useCallback(async () => {
+    try {
+      const res = await fetch('/api/adb-devices');
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Could not list Android devices.');
+      setAdbDevices(data.devices || []);
+      if (data.selectedSerial) setSelectedDevice(data.selectedSerial);
+      const onlineCount = (data.devices || []).filter((device: AdbDevice) => device.state === 'device').length;
+      setDeviceStatus(onlineCount ? `${onlineCount} Android device${onlineCount === 1 ? '' : 's'} online` : 'No online Android device. Enable ADB in BlueStacks or connect a phone.');
+    } catch (error: any) {
+      setDeviceStatus(`ADB unavailable: ${error.message}`);
+    }
+  }, []);
+
+  const refreshOpenRouterStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/openrouter/status');
+      const data = await res.json();
+      setOpenRouterConfigured(Boolean(data.configured));
+      if (data.model) setOpenRouterModel(data.model);
+    } catch {
+      setOpenRouterConfigured(false);
+    }
+  }, []);
+
+  const selectAdbDevice = async (serial: string) => {
+    setSelectedDevice(serial);
+    if (!serial) return;
+    try {
+      const res = await fetch('/api/adb-select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serial }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Could not select device.');
+      setSelectedDevice(data.selectedSerial);
+      setDeviceStatus(`Using ${data.selectedSerial}`);
+    } catch (error: any) {
+      setDeviceStatus(error.message);
+    }
+  };
+
+  const connectBlueStacks = async () => {
+    setIsConnecting(true);
+    try {
+      const res = await fetch('/api/adb-connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address: bluestacksAddress.trim() }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Could not connect to BlueStacks.');
+      setSelectedDevice(data.selectedSerial);
+      setDeviceStatus(`Connected to BlueStacks at ${data.selectedSerial}`);
+      await refreshAdbDevices();
+    } catch (error: any) {
+      setDeviceStatus(error.message);
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  useEffect(() => {
+    void refreshAdbDevices();
+  }, [refreshAdbDevices]);
+
+  useEffect(() => {
+    void refreshOpenRouterStatus();
+  }, [refreshOpenRouterStatus]);
 
   const copyLiveContext = () => {
     navigator.clipboard.writeText(pageText);
@@ -102,8 +179,28 @@ export const AndroidAgent = () => {
   };
 
   const runAgentLoop = async () => {
-    if (!apiKey.trim() || !goal.trim() || !scrcpyDir.trim()) {
-      showError('API Key, Goal, and Scrcpy Directory are required.');
+    if (!goal.trim()) {
+      showError('Goal is required.');
+      return;
+    }
+
+    try {
+      const aiStatusRes = await fetch('/api/openrouter/status');
+      const aiStatus = await aiStatusRes.json();
+      if (!aiStatus.configured) throw new Error('Set OPENROUTER_API_KEY in .env and restart SurveyPilot.');
+      setOpenRouterConfigured(true);
+      if (aiStatus.model) setOpenRouterModel(aiStatus.model);
+
+      const deviceRes = await fetch('/api/adb-select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serial: selectedDevice }),
+      });
+      const deviceData = await deviceRes.json();
+      if (!deviceData.success) throw new Error(deviceData.error || 'Select an online Android device first.');
+      setSelectedDevice(deviceData.selectedSerial);
+    } catch (error: any) {
+      showError(error.message);
       return;
     }
 
@@ -113,6 +210,7 @@ export const AndroidAgent = () => {
     
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
+    let totalCostUsd = 0;
     let conversationHistory: any[] = [];
     let cdpRetryCount = 0;
     let surveysCompletedThisRun = 0;
@@ -132,11 +230,6 @@ export const AndroidAgent = () => {
       });
       addLog('info', 'Waiting 3s for app to load...');
       await new Promise(r => setTimeout(r, 3000));
-
-      const anthropic = new Anthropic({
-        apiKey: apiKey,
-        dangerouslyAllowBrowser: true,
-      });
 
       const systemPrompt = `You are a hybrid automated agent controlling an Android device. You dynamically switch between NATIVE MODE and WEB MODE based on the provided context.
 
@@ -195,7 +288,28 @@ General Rules:
 - If you see a dialog asking why you are leaving early, tap Lost interest to confirm the exit.
 - If you need to wait for a loading screen or network request, use action: "wait".
 - If the goal is completely achieved or impossible to progress further, use action: "done".
-- Respond ONLY with the raw JSON object. Do not wrap in Markdown.`;
+- Return the requested action through the submit_android_action function. Do not return prose or Markdown.`;
+
+      const actionTools = [{
+        type: 'function',
+        function: {
+          name: 'submit_android_action',
+          description: 'Return exactly one action for the current Android or WebView screen.',
+          parameters: {
+            type: 'object',
+            properties: {
+              observation: { type: 'string', description: 'Brief description of the visible screen and target.' },
+              action: { type: 'string', enum: ['tap', 'evaluate', 'wait', 'done'] },
+              x: { type: 'integer', description: 'Tap x coordinate for native mode.' },
+              y: { type: 'integer', description: 'Tap y coordinate for native mode.' },
+              script: { type: 'string', description: 'JavaScript to evaluate in WebView mode.' },
+              reason: { type: 'string', description: 'Why this action is appropriate.' },
+            },
+            required: ['observation', 'action', 'reason'],
+            additionalProperties: false,
+          },
+        },
+      }];
 
       while (isRunningRef.current) {
         addLog('info', 'Analyzing current screen state (XML Dump)...');
@@ -205,7 +319,7 @@ General Rules:
           const xmlRes = await fetch('/api/dump-xml', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ directory: scrcpyDir }),
+            body: JSON.stringify({}),
           });
           const xmlData = await xmlRes.json();
           if (xmlData.success) rawXml = xmlData.xml || '';
@@ -418,7 +532,7 @@ General Rules:
           ];
         }
 
-        addLog('info', `Sending context to Claude...`);
+        addLog('info', `Sending context to ${openRouterModel} via OpenRouter...`);
         conversationHistory.push({
           role: "user",
           content: userMessageContent,
@@ -428,37 +542,84 @@ General Rules:
           conversationHistory.splice(0, 2);
         }
 
-        const response = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
-          system: systemPrompt,
-          max_tokens: 512,
-          messages: conversationHistory,
+        const responseRes = await fetch('/api/openrouter/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            system: systemPrompt,
+            max_tokens: 512,
+            tools: actionTools,
+            tool_choice: { type: 'function', function: { name: 'submit_android_action' } },
+            messages: conversationHistory.map((message: any) => ({
+              role: message.role,
+              content: Array.isArray(message.content)
+                ? message.content.map((part: any) => part.text || '').join('\n')
+                : message.content,
+            })),
+          }),
         });
+        const response = await responseRes.json();
+        if (!responseRes.ok || !response.success) {
+          throw new Error(response.error?.message || response.error || `OpenRouter request failed (${responseRes.status}).`);
+        }
         
         if (response.usage) {
-          totalInputTokens += response.usage.input_tokens;
-          totalOutputTokens += response.usage.output_tokens;
+          totalInputTokens += response.usage.prompt_tokens || 0;
+          totalOutputTokens += response.usage.completion_tokens || 0;
+          totalCostUsd += Number(response.usage.cost) || 0;
           
-          const currentCost = (totalInputTokens / 1_000_000) * 3.00 + (totalOutputTokens / 1_000_000) * 15.00;
-          if (currentCost >= parseFloat(maxCost)) {
+          if (totalCostUsd >= parseFloat(maxCost)) {
             addLog('error', `Cost limit $${maxCost} reached! Stopping agent.`);
             isRunningRef.current = false;
             break;
           }
         }
 
-        const responseText = response.content.find(c => c.type === 'text')?.text || '';
+        const choice = response.choices?.[0];
+        const assistantMessage = choice?.message;
+        const messageContent = assistantMessage?.content;
+        const responseText = typeof messageContent === 'string'
+          ? messageContent
+          : Array.isArray(messageContent)
+            ? messageContent.map((part: any) => part.text || '').join('\n')
+            : '';
         conversationHistory.push({ role: "assistant", content: responseText });
 
         let action;
         try {
-          const startIndex = responseText.indexOf('{');
-          const endIndex = responseText.lastIndexOf('}');
-          if (startIndex === -1 || endIndex === -1) throw new Error("No JSON object found");
-          action = JSON.parse(responseText.substring(startIndex, endIndex + 1));
+          const actionCall = assistantMessage?.tool_calls?.find((call: any) => call.function?.name === 'submit_android_action');
+          if (actionCall?.function?.arguments) {
+            action = typeof actionCall.function.arguments === 'string'
+              ? JSON.parse(actionCall.function.arguments)
+              : actionCall.function.arguments;
+          } else {
+            const fencedJson = responseText.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
+            const jsonCandidate = fencedJson || responseText.slice(responseText.indexOf('{'), responseText.lastIndexOf('}') + 1);
+            if (!jsonCandidate || jsonCandidate === responseText && !responseText.includes('{')) throw new Error('No action tool call or JSON object found');
+            action = JSON.parse(jsonCandidate);
+          }
+          if (!action || !['tap', 'evaluate', 'wait', 'done'].includes(action.action) || typeof action.observation !== 'string' || typeof action.reason !== 'string') {
+            throw new Error('Action is missing required fields or has an unsupported action type');
+          }
+          if (action.action === 'tap' && (!Number.isFinite(action.x) || !Number.isFinite(action.y) || action.x < 0 || action.y < 0)) {
+            throw new Error('Tap actions require non-negative numeric x and y coordinates');
+          }
+          if (action.action === 'evaluate' && (typeof action.script !== 'string' || mode !== 'WEB')) {
+            throw new Error('Evaluate actions require a script and WEB mode');
+          }
+          if (action.action === 'tap' && mode !== 'NATIVE') throw new Error('Tap actions can only be used in NATIVE mode');
+          consecutiveFailures = 0;
         } catch (e) {
-          addLog('error', `Claude returned invalid JSON. Retrying...`);
+          const detail = e instanceof Error ? e.message : 'Unknown action parse error';
+          const preview = responseText.replace(/\s+/g, ' ').slice(0, 180);
+          addLog('error', `Invalid model action (${choice?.finish_reason || 'no finish reason'}): ${detail}${preview ? ` · Reply: ${preview}` : ' · No text content'} `);
           consecutiveFailures++;
+          if (consecutiveFailures >= 3) {
+            addLog('error', 'Stopping after 3 invalid model actions. Check the provider response details before retrying.');
+            showError('The model returned invalid actions 3 times. The agent was stopped; check the log for response details.');
+            isRunningRef.current = false;
+            break;
+          }
           await new Promise(r => setTimeout(r, 2000));
           continue;
         }
@@ -544,7 +705,7 @@ General Rules:
               const nextXmlRes = await fetch('/api/dump-xml', { 
                 method: 'POST', 
                 headers: { 'Content-Type': 'application/json' }, 
-                body: JSON.stringify({ directory: scrcpyDir }) 
+                body: JSON.stringify({})
               });
               const nextXmlData = await nextXmlRes.json();
               
@@ -606,9 +767,7 @@ General Rules:
       showError('Agent encountered an error. Check logs.');
     } finally {
       if (totalInputTokens > 0 || totalOutputTokens > 0) {
-        const inputCost = (totalInputTokens / 1_000_000) * 3.00;
-        const outputCost = (totalOutputTokens / 1_000_000) * 15.00;
-        addLog('success', `Session complete! Tokens: ${totalInputTokens} in / ${totalOutputTokens} out — Cost: $${(inputCost + outputCost).toFixed(4)}`);
+        addLog('success', `Session complete! Tokens: ${totalInputTokens} in / ${totalOutputTokens} out — Cost: $${totalCostUsd.toFixed(4)}`);
       }
       setIsRunning(false);
       isRunningRef.current = false;
@@ -641,16 +800,13 @@ General Rules:
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-2">
-              <label className="text-sm font-semibold text-gray-700 dark:text-gray-300">Anthropic API Key</label>
-              <input
-                type="password"
-                value={apiKey}
-                onChange={(e) => {
-                  setApiKey(e.target.value);
-                  localStorage.setItem('anthropic_api_key', e.target.value);
-                }}
-                className="w-full px-4 py-2.5 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-xl outline-none focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all text-sm"
-              />
+              <label className="text-sm font-semibold text-gray-700 dark:text-gray-300">AI Provider and Model</label>
+              <div className="px-4 py-2.5 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-xl text-sm font-medium">
+                {openRouterModel}
+              </div>
+              <p className={`text-xs ${openRouterConfigured ? 'text-emerald-600' : 'text-red-500'}`}>
+                {openRouterConfigured ? 'API key loaded from the local .env file' : 'Set OPENROUTER_API_KEY in .env and restart'}
+              </p>
             </div>
             
             <div className="space-y-2">
@@ -673,19 +829,39 @@ General Rules:
 
           <div className="space-y-2">
             <label className="text-sm font-semibold text-gray-700 dark:text-gray-300 flex items-center gap-2">
-              <FolderOpen size={16} className="text-orange-500" />
-              Scrcpy Folder Path (contains adb)
+              <Smartphone size={16} className="text-orange-500" /> Android Device
             </label>
-            <input
-              type="text"
-              value={scrcpyDir}
-              onChange={(e) => {
-                setScrcpyDir(e.target.value);
-                localStorage.setItem('scrcpy_directory', e.target.value);
-              }}
-              placeholder="C:\path\to\scrcpy"
-              className="w-full px-4 py-2.5 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-xl outline-none focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 transition-all font-mono text-sm"
-            />
+            <div className="flex flex-col sm:flex-row gap-2">
+              <select
+                value={selectedDevice}
+                onChange={(e) => void selectAdbDevice(e.target.value)}
+                className="flex-1 min-w-0 px-4 py-2.5 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-xl outline-none focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 text-sm"
+              >
+                <option value="">Select connected device</option>
+                {adbDevices.map(device => (
+                  <option key={device.serial} value={device.serial} disabled={device.state !== 'device'}>
+                    {device.serial} · {device.state}{device.details ? ` · ${device.details}` : ''}
+                  </option>
+                ))}
+              </select>
+              <button type="button" onClick={() => void refreshAdbDevices()} className="px-4 py-2.5 border border-gray-200 dark:border-gray-700 rounded-xl text-sm font-semibold">
+                Refresh
+              </button>
+            </div>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="text"
+                value={bluestacksAddress}
+                onChange={(e) => setBluestacksAddress(e.target.value)}
+                placeholder="127.0.0.1:5555"
+                aria-label="BlueStacks ADB address"
+                className="flex-1 min-w-0 px-4 py-2.5 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-xl outline-none focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500 font-mono text-sm"
+              />
+              <button type="button" onClick={() => void connectBlueStacks()} disabled={isConnecting} className="px-4 py-2.5 bg-orange-500 hover:bg-orange-600 disabled:bg-orange-300 text-white rounded-xl text-sm font-semibold">
+                {isConnecting ? 'Connecting…' : 'Connect BlueStacks'}
+              </button>
+            </div>
+            <p className="text-xs text-gray-500 dark:text-gray-400">Enable Android Debug Bridge in BlueStacks settings and use the port shown there. {deviceStatus}</p>
           </div>
 
           <div className="grid grid-cols-2 gap-4">
