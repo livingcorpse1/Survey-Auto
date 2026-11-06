@@ -9,6 +9,7 @@ import { buildNativeContext, deriveScreenSize, findNextButton, fnv1aHash, parseU
 import { parseWmSize, resolveExitTap } from '@/lib/agent/screen';
 import { actionKey, createLoopState, updateLoopState } from '@/lib/agent/loop';
 import { shouldAutoTapNext } from '@/lib/agent/taps';
+import { diffScreen } from '@/lib/agent/verify';
 import { buildSystemPrompt, getPlaybook } from '@/lib/agent/playbooks';
 import {
   DEFAULT_HISTORY_WINDOW_STEPS,
@@ -660,29 +661,59 @@ export const AndroidAgent = () => {
             const tapPoint = { x: action.x, y: action.y };
             addLog('info', `Sending ADB Tap to ${tapPoint.x}, ${tapPoint.y}...`);
             try {
+              const beforeXml = rawXml;
               await tap(tapPoint.x, tapPoint.y, signal);
               await sleep(500, signal);
 
+              let nextXml = '';
               let nextNodes: UiNode[] = [];
               try {
-                nextNodes = parseUiNodes(await dumpXml(signal));
+                nextXml = await dumpXml(signal);
+                nextNodes = parseUiNodes(nextXml);
               } catch (error) {
                 if (isAbortError(error)) throw error;
               }
-              const nextButton = findNextButton(nextNodes);
 
-              if (nextButton && shouldAutoTapNext(tapPoint, nextButton)) {
-                addLog('info', `Auto-clicking ${nextButton.text || nextButton.desc} at ${nextButton.centerX}, ${nextButton.centerY}`);
-                await tap(nextButton.centerX, nextButton.centerY, signal);
-                actionDetail = `Tapped and then pressed ${nextButton.text || nextButton.desc}.`;
-              } else if (nextButton) {
-                addLog('debug', 'Skipping auto-Next because the tap already targeted the Next control.');
-                actionDetail = 'Tap already targeted the Next control; auto-tap guarded.';
+              const landed = diffScreen(beforeXml, nextXml);
+              if (!landed.changed) {
+                addLog('info', `Tap did not change the screen; retrying once at ${tapPoint.x}, ${tapPoint.y}...`);
+                await sleep(1200, signal);
+                await tap(tapPoint.x, tapPoint.y, signal);
+                await sleep(800, signal);
+                try {
+                  nextXml = await dumpXml(signal);
+                  nextNodes = parseUiNodes(nextXml);
+                } catch (error) {
+                  if (isAbortError(error)) throw error;
+                }
+                const retried = diffScreen(beforeXml, nextXml);
+                if (!retried.changed) {
+                  actionFailed = true;
+                  actionDetail = 'Tap had no visible effect after one retry.';
+                  addLog('error', 'Tap had no visible effect; marking the action failed.');
+                } else {
+                  addLog('info', `Tap landed on retry: ${retried.addedLabels[0] ?? 'screen changed'}`);
+                }
               } else {
-                actionDetail = 'Tap sent; no Next control found yet.';
+                addLog('debug', `Tap changed the screen${landed.addedLabels[0] ? ` (new: ${landed.addedLabels[0]})` : ''}.`);
               }
 
-              consecutiveFailures = 0;
+              if (!actionFailed) {
+                const nextButton = findNextButton(nextNodes);
+
+                if (nextButton && shouldAutoTapNext(tapPoint, nextButton)) {
+                  addLog('info', `Auto-clicking ${nextButton.text || nextButton.desc} at ${nextButton.centerX}, ${nextButton.centerY}`);
+                  await tap(nextButton.centerX, nextButton.centerY, signal);
+                  actionDetail = `Tapped and then pressed ${nextButton.text || nextButton.desc}.`;
+                } else if (nextButton) {
+                  addLog('debug', 'Skipping auto-Next because the tap already targeted the Next control.');
+                  actionDetail = 'Tap already targeted the Next control; auto-tap guarded.';
+                } else {
+                  actionDetail = 'Tap sent; no Next control found yet.';
+                }
+
+                consecutiveFailures = 0;
+              }
             } catch (error) {
               if (isAbortError(error)) throw error;
               addLog('error', `ADB Tap failed: ${error instanceof Error ? error.message : String(error)}`);
