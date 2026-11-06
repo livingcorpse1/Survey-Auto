@@ -177,6 +177,20 @@ export const AndroidAgent = () => {
     return typeof data.xml === 'string' ? data.xml : '';
   };
 
+  const ensureDevice = async (signal?: AbortSignal) => {
+    const res = await abortableFetch('/api/adb-ensure', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ serial: selectedDevice }),
+    }, signal);
+    return res.json() as Promise<{
+      success: boolean;
+      reconnected?: boolean;
+      reconnectTarget?: string | null;
+      recoveryReason?: string | null;
+    }>;
+  };
+
   const tap = (x: number, y: number, signal?: AbortSignal) => postJson('/api/adb-tap', { x, y }, signal);
 
   const sendBack = (signal?: AbortSignal) => postJson('/api/adb-keyevent', { key: 4 }, signal);
@@ -237,6 +251,7 @@ export const AndroidAgent = () => {
     let loopStrikes = 0;
     let loopState = createLoopState();
     let webModeStartTime: number | null = null;
+    let deviceRecoveryAttempts = 0;
 
     const appName = APPS.find(a => a.package === appPackage)?.name || appPackage;
     const playbook = getPlaybook(appPackage);
@@ -308,6 +323,31 @@ export const AndroidAgent = () => {
 
       while (isRunningRef.current && !signal.aborted) {
         throwIfAborted(signal);
+
+        let health: Awaited<ReturnType<typeof ensureDevice>> | null = null;
+        try {
+          health = await ensureDevice(signal);
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          addLog('error', `ADB device check failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+
+        if (health) {
+          if (health.reconnected) {
+            addLog('info', `Reconnected adb to ${health.reconnectTarget ?? 'device'}.`);
+          }
+          if (!health.success) {
+            deviceRecoveryAttempts += 1;
+            addLog('info', `ADB device not ready (${health.recoveryReason ?? 'unknown'}); attempt ${deviceRecoveryAttempts}/8.`);
+            if (deviceRecoveryAttempts >= 8) {
+              throw new Error(`ADB device unavailable (${health.recoveryReason ?? 'unknown'}). Reconnect the emulator or phone and retry.`);
+            }
+            await sleep(2500, signal);
+            continue;
+          }
+          deviceRecoveryAttempts = 0;
+        }
+
         addLog('info', 'Analyzing current screen state (XML Dump)...');
 
         let rawXml = '';
