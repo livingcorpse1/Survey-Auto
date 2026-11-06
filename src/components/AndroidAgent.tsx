@@ -10,6 +10,7 @@ import { parseWmSize, resolveExitTap } from '@/lib/agent/screen';
 import { actionKey, createLoopState, updateLoopState } from '@/lib/agent/loop';
 import { shouldAutoTapNext } from '@/lib/agent/taps';
 import { diffScreen } from '@/lib/agent/verify';
+import { checkSurveyBudget, createSurveyState, recordSurveyStep } from '@/lib/agent/survey';
 import { buildSystemPrompt, getPlaybook } from '@/lib/agent/playbooks';
 import {
   DEFAULT_HISTORY_WINDOW_STEPS,
@@ -253,6 +254,7 @@ export const AndroidAgent = () => {
     let loopState = createLoopState();
     let webModeStartTime: number | null = null;
     let deviceRecoveryAttempts = 0;
+    let surveyState = createSurveyState();
 
     const appName = APPS.find(a => a.package === appPackage)?.name || appPackage;
     const playbook = getPlaybook(appPackage);
@@ -264,6 +266,7 @@ export const AndroidAgent = () => {
       loopState = createLoopState();
       loopStrikes = 0;
       consecutiveFailures = 0;
+      surveyState = createSurveyState();
     };
 
     const exitSurvey = async (message: string) => {
@@ -498,6 +501,15 @@ export const AndroidAgent = () => {
             setWsUrl(null);
             continue;
           }
+        }
+
+        surveyState = recordSurveyStep(surveyState, { mode, fingerprint });
+        const budget = checkSurveyBudget(surveyState);
+        if (budget.exceeded) {
+          addLog('error', `Survey budget exceeded: ${budget.reason}`);
+          setStats(prev => ({ ...prev, screenedOut: prev.screenedOut + 1 }));
+          await exitSurvey('Returning to the survey list after the survey budget was exceeded.');
+          continue;
         }
 
         addLog('info', `Sending context to ${openRouterModel} via OpenRouter...`);
