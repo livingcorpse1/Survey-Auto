@@ -10,11 +10,11 @@ export default defineConfig(({ mode }) => {
 
   return {
     server: {
-      host: '::',
+      host: '127.0.0.1',
       port: 8080,
     },
     preview: {
-      host: '::',
+      host: '127.0.0.1',
       port: 8080,
     },
     plugins: [dyadComponentTagger(), react(), createApiPlugin(env)],
