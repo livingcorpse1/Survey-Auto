@@ -2,19 +2,22 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Bot, Play, Square, Loader2, Target, Activity, Code2, DollarSign, CheckCircle, XCircle, AlertTriangle, Smartphone, Copy } from 'lucide-react';
 import { showSuccess, showError } from '@/utils/toast';
 import { cn } from '@/lib/utils';
-
-interface LogEntry {
-  id: string;
-  time: string;
-  type: 'info' | 'action' | 'success' | 'error' | 'debug';
-  message: string;
-}
-
-interface AdbDevice {
-  serial: string;
-  state: string;
-  details: string;
-}
+import type { AdbDevice, AgentAction, ChatMessage, LogEntry, ScreenSize, UiNode } from '@/lib/agent/types';
+import { appendLogEntry } from '@/lib/agent/logs';
+import { abortableFetch, isAbortError, sleep, throwIfAborted } from '@/lib/agent/abort';
+import { buildNativeContext, deriveScreenSize, findNextButton, fnv1aHash, parseUiNodes } from '@/lib/agent/xml';
+import { parseWmSize, resolveExitTap } from '@/lib/agent/screen';
+import { actionKey, createLoopState, updateLoopState } from '@/lib/agent/loop';
+import { shouldAutoTapNext } from '@/lib/agent/taps';
+import { buildSystemPrompt, getPlaybook } from '@/lib/agent/playbooks';
+import {
+  DEFAULT_HISTORY_WINDOW_STEPS,
+  pruneHistory,
+  pushAssistant,
+  pushToolResult,
+  pushUser,
+  toChatMessages,
+} from '@/lib/agent/history';
 
 const APPS = [
   { name: 'AttaPoll', package: 'com.requapp.requ' },
@@ -43,6 +46,8 @@ export const AndroidAgent = () => {
   
   const isRunningRef = useRef(false);
   const wsUrlRef = useRef<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const screenSizeRef = useRef<ScreenSize | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -55,12 +60,12 @@ export const AndroidAgent = () => {
   }, [logs]);
 
   const addLog = (type: LogEntry['type'], message: string) => {
-    setLogs(prev => [...prev, {
+    setLogs(prev => appendLogEntry(prev, {
       id: Math.random().toString(36).substring(7),
       time: new Date().toLocaleTimeString(),
       type,
       message
-    }]);
+    }));
   };
 
   const refreshAdbDevices = useCallback(async () => {
@@ -145,36 +150,51 @@ export const AndroidAgent = () => {
     showSuccess('Execution logs copied to clipboard');
   };
 
-  const executeCDP = async (url: string, script: string) => {
-    const res = await fetch('/api/cdp', {
+  const executeCDP = async (url: string, script: string, signal?: AbortSignal) => {
+    const res = await abortableFetch('/api/cdp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ wsUrl: url, script }),
-    });
+    }, signal);
     const data = await res.json();
     if (!data.success) throw new Error(data.error);
     return data.result?.value;
   };
 
-  const simplifyXml = (rawXml: string) => {
+  const postJson = async (path: string, body: unknown, signal?: AbortSignal) => {
+    const res = await abortableFetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    }, signal);
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || `${path} failed`);
+    return data;
+  };
+
+  const dumpXml = async (signal?: AbortSignal) => {
+    const data = await postJson('/api/dump-xml', {}, signal);
+    return typeof data.xml === 'string' ? data.xml : '';
+  };
+
+  const tap = (x: number, y: number, signal?: AbortSignal) => postJson('/api/adb-tap', { x, y }, signal);
+
+  const sendBack = (signal?: AbortSignal) => postJson('/api/adb-keyevent', { key: 4 }, signal);
+
+  const refreshScreenSize = async (signal?: AbortSignal) => {
     try {
-      const parser = new DOMParser();
-      const xmlDoc = parser.parseFromString(rawXml, "text/xml");
-      const nodes = Array.from(xmlDoc.getElementsByTagName('node'));
-      
-      const simplified = nodes
-        .filter(n => n.getAttribute('clickable') === 'true' || (n.getAttribute('text') || '').trim() !== '' || (n.getAttribute('content-desc') || '').trim() !== '')
-        .map(n => {
-          const clazz = (n.getAttribute('class') || '').split('.').pop();
-          const text = n.getAttribute('text') || '';
-          const desc = n.getAttribute('content-desc') || '';
-          const bounds = n.getAttribute('bounds') || '';
-          return `<${clazz} bounds="${bounds}"${text ? ` text="${text}"` : ''}${desc ? ` desc="${desc}"` : ''} />`;
-        });
-        
-      return simplified.join('\n');
-    } catch (e) {
-      return rawXml;
+      const res = await abortableFetch('/api/screen-size', { method: 'GET' }, signal);
+      const data = await res.json();
+      if (data.success && typeof data.size === 'string') {
+        const parsed = parseWmSize(data.size);
+        if (parsed.width > 0 && parsed.height > 0) {
+          screenSizeRef.current = parsed;
+          addLog('debug', `Screen size: ${parsed.width}x${parsed.height} (${parsed.source})`);
+        }
+      }
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      addLog('debug', `Could not read wm size: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
@@ -184,111 +204,86 @@ export const AndroidAgent = () => {
       return;
     }
 
+    const controller = new AbortController();
+    const signal = controller.signal;
+    abortControllerRef.current = controller;
+
     try {
-      const aiStatusRes = await fetch('/api/openrouter/status');
+      const aiStatusRes = await abortableFetch('/api/openrouter/status', { method: 'GET' }, signal);
       const aiStatus = await aiStatusRes.json();
       if (!aiStatus.configured) throw new Error('Set OPENROUTER_API_KEY in .env and restart SurveyPilot.');
       setOpenRouterConfigured(true);
       if (aiStatus.model) setOpenRouterModel(aiStatus.model);
 
-      const deviceRes = await fetch('/api/adb-select', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ serial: selectedDevice }),
-      });
-      const deviceData = await deviceRes.json();
-      if (!deviceData.success) throw new Error(deviceData.error || 'Select an online Android device first.');
-      setSelectedDevice(deviceData.selectedSerial);
+      const deviceData = await postJson('/api/adb-select', { serial: selectedDevice }, signal);
+      if (deviceData.selectedSerial) setSelectedDevice(deviceData.selectedSerial);
     } catch (error: any) {
-      showError(error.message);
+      abortControllerRef.current = null;
+      if (!isAbortError(error)) showError(error.message);
       return;
     }
 
     setIsRunning(true);
     isRunningRef.current = true;
     wsUrlRef.current = wsUrl;
-    
+
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let totalCostUsd = 0;
-    let conversationHistory: any[] = [];
+    let conversationHistory: ChatMessage[] = [];
     let cdpRetryCount = 0;
     let surveysCompletedThisRun = 0;
     let consecutiveFailures = 0;
-    let lastActionString = "";
+    let loopStrikes = 0;
+    let loopState = createLoopState();
     let webModeStartTime: number | null = null;
-    
+
     const appName = APPS.find(a => a.package === appPackage)?.name || appPackage;
+    const playbook = getPlaybook(appPackage);
+    const systemPrompt = buildSystemPrompt(playbook);
     addLog('info', `Starting Hybrid Agent Loop... (App: ${appName}, Max Spend: $${maxCost}, Goal: ${surveyGoal} surveys)`);
-    
+
+    const resetConversation = () => {
+      conversationHistory = [];
+      loopState = createLoopState();
+      loopStrikes = 0;
+      consecutiveFailures = 0;
+    };
+
+    const exitSurvey = async (message: string) => {
+      addLog('info', message);
+      try {
+        await sendBack(signal);
+        await sleep(1200, signal);
+        const nodes = parseUiNodes(await dumpXml(signal));
+        const fallbackScreen = deriveScreenSize(nodes);
+        const screen = screenSizeRef.current && screenSizeRef.current.width > 0
+          ? screenSizeRef.current
+          : fallbackScreen;
+        if ((!screenSizeRef.current || screenSizeRef.current.width === 0) && screen.width > 0) {
+          screenSizeRef.current = screen;
+        }
+        const target = resolveExitTap(nodes, screen);
+        addLog('debug', `Exit target: ${target.derivedFrom} (${target.target}) -> ${target.x}, ${target.y}`);
+        await tap(target.x, target.y, signal);
+        addLog('info', 'Confirmed survey exit.');
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        addLog('error', `Failed to exit survey: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      wsUrlRef.current = null;
+      setWsUrl(null);
+      webModeStartTime = null;
+      resetConversation();
+      await sleep(1500, signal);
+    };
+
     try {
       addLog('info', `Launching ${appName} (${appPackage})...`);
-      await fetch('/api/launch-app', { 
-        method: 'POST', 
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ appPackage }) 
-      });
+      await postJson('/api/launch-app', { appPackage }, signal);
       addLog('info', 'Waiting 3s for app to load...');
-      await new Promise(r => setTimeout(r, 3000));
-
-      const systemPrompt = `You are a hybrid automated agent controlling an Android device. You dynamically switch between NATIVE MODE and WEB MODE based on the provided context.
-
-If provided with UI XML, you are in NATIVE MODE:
-- Analyze the simplified UI XML to find the element that progresses the goal.
-- To click an element, calculate the center (x, y) of its bounds="[x1,y1][x2,y2]" and provide the exact x and y coordinates.
-- After selecting a multiple choice answer, ALWAYS tap the Next button in the same action sequence. If you see a Next button in the XML, tap the answer first, then on the very next action tap Next — never leave a question without tapping Next.
-- Also: if you see a screen with 'Sorry that didn't work out', tap the X/close button (top right corner) to return to the survey list.
-- JSON Format:
-{
-  "observation": "what you see and what element you target",
-  "action": "tap" | "wait" | "done",
-  "x": 123,
-  "y": 456,
-  "reason": "why you are tapping here"
-}
-
-If provided with DOM Text and HTML, you are in WEB MODE:
-- Analyze the page text and exact HTML to find precise selectors.
-- Write robust JavaScript to interact with the DOM using exact IDs or classes when possible (e.g., document.querySelector('#choice-0').click()).
-- Before clicking any element, verify its selector exists in the HTML provided. If you cannot find the exact selector in the HTML, use document.querySelector and check what elements are actually present.
-- When filling inputs or selecting options, always find the submit/next button by examining the actual HTML provided. Look for buttons with type='submit', or buttons containing text like 'Next', 'Continue', 'Submit', 'Suivant'. Use the exact selector from the HTML. Never hardcode button selectors — always derive them from the page HTML.
-- Also use unique variable names in every script (add a random suffix like _12345) to avoid redeclaration errors.
-- JSON Format:
-{
-  "observation": "what you see and what element you target",
-  "action": "evaluate" | "wait" | "done",
-  "script": "document.querySelector('button.submit').click();",
-  "reason": "why you are executing this script"
-}
-
-General Rules:
-- SURVEY SELECTION RULE: Always pick the fastest survey available (lowest minutes). Fast surveys are simpler, have lower screen-out risk, and keep the loop moving. If two surveys have the same time, pick the higher paying one. Never pick surveys over 5 minutes. For 5Surveys, since time is not shown, pick surveys with the lowest star rating (1-2 stars) as they tend to be shorter and simpler.
-- CRITICAL PROGRESSION RULE: Once you have tapped on a survey and entered it (you can tell because the XML shows survey questions instead of a survey list), you have ALREADY found and selected the correct survey. DO NOT go back. Your ONLY job at that point is to answer the questions and tap Submit. Never go back to the survey list once inside a survey unless the survey is finished or shows an error.
-- QUALIFICATION QUESTIONS: When you see a qualification popup with answer options visible in the PAGE TEXT, click immediately using innerText matching — do NOT use children.length === 0 as a filter since options have child elements. Use this pattern:
-  Array.from(document.querySelectorAll('label, li, div, span')).find(el => el.innerText && el.innerText.trim() === 'EXACT_OPTION_TEXT')?.click();
-  Then immediately click the Next button after selecting.
-  Always pick the most neutral answer (e.g. 'None of the above', 'No', 'I do not consume alcohol', 'I don\\'t read newspapers or magazines').
-  NOTE: The above qualification question rule applies specifically to 5Surveys. For 5Surveys qualification popups, use innerText matching without children.length filtering:
-  Array.from(document.querySelectorAll('label, li, div, span')).find(el => el.innerText && el.innerText.trim() === 'I don\\'t read newspapers or magazines')?.click();
-- CRITICAL: When filling a textarea or input, ALWAYS click the Next button in the same script immediately after filling. Never split fill and click into separate steps.
-- When filling any input field, always trigger focus BEFORE setting value and blur AFTER, in addition to input and change events:
-  var input = document.getElementById('myInput');
-  input.focus();
-  input.value = 'text';
-  input.dispatchEvent(new Event('input', {bubbles: true}));
-  input.dispatchEvent(new Event('change', {bubbles: true}));
-  input.blur();
-  document.querySelector('button.next-button').click();
-  This is required for React and Next.js forms to recognize the input as valid and enable the submit button.
-- For Quest Mindshare surveys (you can tell by 'css-175oi2r' classes in the HTML), use the native input setter to trigger React state:
-  var nativeSetter_xyz = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-  nativeSetter_xyz.call(input_xyz, 'your answer here');
-  input_xyz.dispatchEvent(new Event('input', {bubbles: true}));
-- IMPORTANT: IDs that start with numbers are not valid CSS selectors. Never use querySelector('#0') or querySelector('#1'). Instead use: document.getElementById('0').click()
-- If you see a dialog asking why you are leaving early, tap Lost interest to confirm the exit.
-- If you need to wait for a loading screen or network request, use action: "wait".
-- If the goal is completely achieved or impossible to progress further, use action: "done".
-- Return the requested action through the submit_android_action function. Do not return prose or Markdown.`;
+      await sleep(3000, signal);
+      await refreshScreenSize(signal);
 
       const actionTools = [{
         type: 'function',
@@ -311,36 +306,29 @@ General Rules:
         },
       }];
 
-      while (isRunningRef.current) {
+      while (isRunningRef.current && !signal.aborted) {
+        throwIfAborted(signal);
         addLog('info', 'Analyzing current screen state (XML Dump)...');
-        
+
         let rawXml = '';
         try {
-          const xmlRes = await fetch('/api/dump-xml', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({}),
-          });
-          const xmlData = await xmlRes.json();
-          if (xmlData.success) rawXml = xmlData.xml || '';
-        } catch (e: any) {
-          addLog('error', `XML Dump failed: ${e.message}`);
+          rawXml = await dumpXml(signal);
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          addLog('error', `XML Dump failed: ${error instanceof Error ? error.message : String(error)}`);
         }
 
         const isAppOpen = rawXml.includes(`package="${appPackage}"`);
         if (!isAppOpen && rawXml.length > 200) {
           addLog('error', `${appName} closed! Relaunching...`);
           setStats(prev => ({ ...prev, cdpCrashes: prev.cdpCrashes + 1 }));
-          
-          await fetch('/api/launch-app', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ appPackage })
-          });
+          await postJson('/api/launch-app', { appPackage }, signal);
           wsUrlRef.current = null;
           setWsUrl(null);
           webModeStartTime = null;
-          await new Promise(r => setTimeout(r, 3000));
+          resetConversation();
+          await sleep(3000, signal);
+          await refreshScreenSize(signal);
           continue;
         }
 
@@ -349,8 +337,10 @@ General Rules:
         const hasWebView = rawXml.includes('class="android.webkit.WebView"');
         const hasRealElements = rawXml.length > 200 && rawXml.includes('<node') && !hasWebView;
         const mode = hasRealElements ? 'NATIVE' : 'WEB';
-        
         addLog('info', `Detected Mode: ${mode}`);
+
+        let userText = '';
+        let fingerprint = '';
 
         if (mode === 'NATIVE') {
           webModeStartTime = null;
@@ -359,131 +349,85 @@ General Rules:
             wsUrlRef.current = null;
             setWsUrl(null);
           }
-        }
 
-        let userMessageContent: any[] = [];
-
-        if (mode === 'NATIVE') {
-          const simpleXml = simplifyXml(rawXml).substring(0, 2000);
-          setPageText(`// NATIVE UI DETECTED\n\n${simpleXml}`);
-          
-          userMessageContent = [
-            {
-              type: "text",
-              text: `Current Mode: NATIVE\nGoal: ${goal}\n\nSimplified UI XML:\n${simpleXml}\n\nAnalyze the XML bounds and provide the exact center x,y coordinates to tap.`,
-            }
-          ];
+          const context = buildNativeContext(rawXml);
+          if ((!screenSizeRef.current || screenSizeRef.current.width === 0) && context.screen.width > 0) {
+            screenSizeRef.current = context.screen;
+          }
+          const screen = screenSizeRef.current ?? context.screen;
+          fingerprint = context.fingerprint;
+          setPageText(`// NATIVE UI DETECTED\n\nScreen: ${screen.width}x${screen.height}\n\n${context.text}`);
+          userText = `Current Mode: NATIVE\nGoal: ${goal}\nScreen: ${screen.width}x${screen.height}\n\nInteractive UI nodes (${context.shownCount}/${context.totalCount} shown):\n${context.text}\n\nAnalyze the bounds and return the exact center x,y to tap.`;
         } else {
           if (!webModeStartTime) webModeStartTime = Date.now();
-          
+
           if (!wsUrlRef.current) {
             addLog('info', 'Setting up CDP Connection for WebView...');
             try {
-              const cdpRes = await fetch('/api/setup-cdp', { 
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ appPackage })
-              });
-              const cdpData = await cdpRes.json();
-              if (!cdpData.success) throw new Error(cdpData.error);
+              const cdpData = await postJson('/api/setup-cdp', { appPackage }, signal);
               wsUrlRef.current = cdpData.wsUrl;
               setWsUrl(cdpData.wsUrl);
               cdpRetryCount = 0;
               addLog('success', 'CDP Connection Established!');
-            } catch (e: any) {
+            } catch (error) {
+              if (isAbortError(error)) throw error;
               cdpRetryCount++;
               if (cdpRetryCount >= 3) {
                 addLog('error', 'CDP Setup failed 3 times. Survey may not support WebView debugging. Skipping.');
                 setStats(prev => ({ ...prev, cdpFailed: prev.cdpFailed + 1 }));
-                
-                try {
-                  await fetch('/api/adb-keyevent', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ key: 4 })
-                  });
-                  addLog('info', 'Sent ADB BACK command to skip survey.');
-                  await new Promise(r => setTimeout(r, 2000));
-                  await fetch('/api/adb-tap', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ x: 541, y: 1036 })
-                  });
-                  addLog('info', 'Confirmed survey exit.');
-                } catch(err: any) {
-                  addLog('error', `Failed to send BACK command: ${err.message}`);
-                }
                 cdpRetryCount = 0;
                 webModeStartTime = null;
-              } else {
-                addLog('error', `CDP Setup Failed (Attempt ${cdpRetryCount}/3): ${e.message}`);
+                await exitSurvey('Skipping survey after repeated CDP failures.');
+                continue;
               }
-              await new Promise(r => setTimeout(r, 3000));
+              addLog('error', `CDP Setup Failed (Attempt ${cdpRetryCount}/3): ${error instanceof Error ? error.message : String(error)}`);
+              await sleep(3000, signal);
               continue;
             }
           }
 
           addLog('info', 'Extracting live DOM context via CDP...');
-          let pageState;
           try {
-            const domQuery = `(() => { 
+            const domQuery = `(() => {
               const html = document.body ? document.body.outerHTML : document.documentElement.outerHTML;
-              return JSON.stringify({ 
-                text: document.body ? document.body.innerText : '', 
+              return JSON.stringify({
+                text: document.body ? document.body.innerText : '',
                 html: html || ''
-              }); 
+              });
             })()`;
-            const rawState = await executeCDP(wsUrlRef.current, domQuery);
-            pageState = JSON.parse(rawState);
-            
+            const rawState = await executeCDP(wsUrlRef.current!, domQuery, signal);
+            const pageState = JSON.parse(rawState);
+            fingerprint = fnv1aHash(`${pageState.text}\n${pageState.html || ''}`);
+
             if (pageState.text.trim().length < 50 && (pageState.html || '').includes('ps-loader')) {
               addLog('info', 'Survey stuck on loading — skipping.');
               setStats(prev => ({ ...prev, screenedOut: prev.screenedOut + 1 }));
-              await fetch('/api/adb-keyevent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 4 }) });
-              await new Promise(r => setTimeout(r, 2000));
-              await fetch('/api/adb-tap', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x: 541, y: 1036 }) });
-              wsUrlRef.current = null;
-              setWsUrl(null);
-              webModeStartTime = null;
+              await exitSurvey('Skipping survey stuck on loading.');
               continue;
             }
 
-            const webModeElapsed = Date.now() - webModeStartTime;
+            const webModeElapsed = Date.now() - (webModeStartTime ?? Date.now());
             if (webModeElapsed > 30000) {
               addLog('info', 'Page loading timeout — skipping survey.');
-              webModeStartTime = null;
-              await fetch('/api/adb-keyevent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 4 }) });
-              await new Promise(r => setTimeout(r, 2000));
-              await fetch('/api/adb-tap', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x: 541, y: 1036 }) });
-              wsUrlRef.current = null;
-              setWsUrl(null);
+              await exitSurvey('Skipping survey after a page loading timeout.');
               continue;
             }
-            
+
             const screenOutKeywords = [
-              "don't qualify", "do not qualify", "not eligible", "we're sorry", 
+              "don't qualify", "do not qualify", "not eligible", "we're sorry",
               "thank you for your interest", "unfortunately", "no longer available", "quota full",
               "captcha", "i'm not a robot", "verify you are human", "recaptcha", "are you a robot"
             ];
-            
+
             const textLower = pageState.text.toLowerCase();
             const matchedKeyword = screenOutKeywords.find(k => textLower.includes(k));
 
             if (matchedKeyword) {
               setStats(prev => ({ ...prev, screenedOut: prev.screenedOut + 1 }));
-              const isCaptcha = ["captcha", "i'm not a robot", "verify you are human", "recaptcha", "are you a robot"].includes(matchedKeyword);
-              if (isCaptcha) {
-                addLog('info', 'Captcha detected — skipping survey');
-              } else {
-                addLog('info', 'Survey screen-out detected. Going back to survey list...');
-              }
-              await fetch('/api/adb-keyevent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 4 }) });
-              await new Promise(r => setTimeout(r, 2000));
-              await fetch('/api/adb-tap', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x: 541, y: 1036 }) });
-              addLog('info', 'Confirmed survey exit.');
-              wsUrlRef.current = null;
-              setWsUrl(null);
-              webModeStartTime = null;
+              const captchaKeywords = ["captcha", "i'm not a robot", "verify you are human", "recaptcha", "are you a robot"];
+              const isCaptcha = captchaKeywords.includes(matchedKeyword);
+              addLog('info', isCaptcha ? 'Captcha detected — skipping survey' : 'Survey screen-out detected. Going back to survey list...');
+              await exitSurvey('Returning to the survey list after a screen-out.');
               continue;
             }
 
@@ -491,13 +435,7 @@ General Rules:
             if (hardPlatforms.some(p => (pageState.html || '').toLowerCase().includes(p.toLowerCase()))) {
               addLog('info', 'Complex survey platform detected — skipping.');
               setStats(prev => ({ ...prev, screenedOut: prev.screenedOut + 1 }));
-              await fetch('/api/adb-keyevent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 4 }) });
-              await new Promise(r => setTimeout(r, 2000));
-              await fetch('/api/adb-tap', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x: 541, y: 1036 }) });
-              addLog('info', 'Confirmed survey exit.');
-              wsUrlRef.current = null;
-              setWsUrl(null);
-              webModeStartTime = null;
+              await exitSurvey('Returning to the survey list from an unsupported platform.');
               continue;
             }
 
@@ -505,44 +443,27 @@ General Rules:
             if (hardUIKeywords.some(k => (pageState.html || '').toLowerCase().includes(k))) {
               addLog('info', 'Complex slider/picker UI detected — skipping survey.');
               setStats(prev => ({ ...prev, screenedOut: prev.screenedOut + 1 }));
-              await fetch('/api/adb-keyevent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 4 }) });
-              await new Promise(r => setTimeout(r, 2000));
-              await fetch('/api/adb-tap', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x: 541, y: 1036 }) });
-              addLog('info', 'Confirmed survey exit.');
-              wsUrlRef.current = null;
-              setWsUrl(null);
-              webModeStartTime = null;
+              await exitSurvey('Returning to the survey list from a complex slider/picker UI.');
               continue;
             }
-            
-            setPageText(`// WEB VIEW DETECTED\n\n${pageState.text}\n\n// TRUNCATED HTML (for UI only)\n${(pageState.html || '').substring(0, 2000)}...`);
-          } catch(e: any) {
-            addLog('error', `CDP Context Error: ${e.message}. Dropping connection cache.`);
+
+            setPageText(`// WEB VIEW DETECTED\n\n${pageState.text}\n\n// HTML PREVIEW (for UI only)\n${(pageState.html || '').substring(0, 4000)}...`);
+            const htmlLimit = appPackage === 'com.fivesurveys.mobile' ? 30000 : (pageState.html || '').length;
+            userText = `Current Mode: WEB\nGoal: ${goal}\n\nPAGE TEXT:\n${pageState.text}\n\nPAGE HTML:\n${(pageState.html || '').substring(0, htmlLimit)}\n\nAnalyze the DOM and provide JavaScript to interact with it.`;
+          } catch (error) {
+            if (isAbortError(error)) throw error;
+            addLog('error', `CDP Context Error: ${error instanceof Error ? error.message : String(error)}. Dropping connection cache.`);
             wsUrlRef.current = null;
             setWsUrl(null);
             continue;
           }
-          
-          const htmlLimit = appPackage === 'com.fivesurveys.mobile' ? 30000 : (pageState.html || '').length;
-          userMessageContent = [
-            {
-              type: "text",
-              text: `Current Mode: WEB\nGoal: ${goal}\n\nPAGE TEXT:\n${pageState.text}\n\nPAGE HTML:\n${(pageState.html || '').substring(0, htmlLimit)}\n\nAnalyze the DOM and provide JavaScript to interact with it.`,
-            }
-          ];
         }
 
         addLog('info', `Sending context to ${openRouterModel} via OpenRouter...`);
-        conversationHistory.push({
-          role: "user",
-          content: userMessageContent,
-        });
+        pushUser(conversationHistory, userText);
+        conversationHistory = pruneHistory(conversationHistory, DEFAULT_HISTORY_WINDOW_STEPS);
 
-        if (conversationHistory.length > 2) {
-          conversationHistory.splice(0, 2);
-        }
-
-        const responseRes = await fetch('/api/openrouter/chat', {
+        const responseRes = await abortableFetch('/api/openrouter/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -550,24 +471,19 @@ General Rules:
             max_tokens: 4096,
             tools: actionTools,
             tool_choice: { type: 'function', function: { name: 'submit_android_action' } },
-            messages: conversationHistory.map((message: any) => ({
-              role: message.role,
-              content: Array.isArray(message.content)
-                ? message.content.map((part: any) => part.text || '').join('\n')
-                : message.content,
-            })),
+            messages: toChatMessages(conversationHistory),
           }),
-        });
+        }, signal);
         const response = await responseRes.json();
         if (!responseRes.ok || !response.success) {
           throw new Error(response.error?.message || response.error || `OpenRouter request failed (${responseRes.status}).`);
         }
-        
+
         if (response.usage) {
           totalInputTokens += response.usage.prompt_tokens || 0;
           totalOutputTokens += response.usage.completion_tokens || 0;
           totalCostUsd += Number(response.usage.cost) || 0;
-          
+
           if (totalCostUsd >= parseFloat(maxCost)) {
             addLog('error', `Cost limit $${maxCost} reached! Stopping agent.`);
             isRunningRef.current = false;
@@ -581,13 +497,23 @@ General Rules:
         const responseText = typeof messageContent === 'string'
           ? messageContent
           : Array.isArray(messageContent)
-            ? messageContent.map((part: any) => part.text || '').join('\n')
+            ? messageContent.map((part: { text?: string }) => part.text || '').join('\n')
             : '';
-        conversationHistory.push({ role: "assistant", content: responseText });
+        const assistantToolCalls = assistantMessage?.tool_calls;
+        pushAssistant(conversationHistory, { content: responseText, tool_calls: assistantToolCalls });
 
-        let action;
+        let action: AgentAction | undefined;
+        const respondToTools = (ok: boolean, detail: string) => {
+          for (const call of assistantToolCalls ?? []) {
+            const payload = call.function?.name === 'submit_android_action'
+              ? JSON.stringify({ ok, action: action?.action ?? null, detail })
+              : JSON.stringify({ ok: false, detail: 'Unsupported tool call.' });
+            if (call?.id) pushToolResult(conversationHistory, call.id, payload);
+          }
+        };
+
         try {
-          const actionCall = assistantMessage?.tool_calls?.find((call: any) => call.function?.name === 'submit_android_action');
+          const actionCall = assistantToolCalls?.find((call: { function?: { name?: string } }) => call.function?.name === 'submit_android_action');
           if (actionCall?.function?.arguments) {
             action = typeof actionCall.function.arguments === 'string'
               ? JSON.parse(actionCall.function.arguments)
@@ -609,12 +535,13 @@ General Rules:
           }
           if (action.action === 'tap' && mode !== 'NATIVE') throw new Error('Tap actions can only be used in NATIVE mode');
           consecutiveFailures = 0;
-        } catch (e) {
+        } catch (error) {
           const detail = choice?.finish_reason === 'length'
             ? 'Response hit the token limit before returning an action'
-            : e instanceof Error ? e.message : 'Unknown action parse error';
+            : error instanceof Error ? error.message : 'Unknown action parse error';
           const preview = responseText.replace(/\s+/g, ' ').slice(0, 180);
           addLog('error', `Invalid model action (${choice?.finish_reason || 'no finish reason'}): ${detail}${preview ? ` · Reply: ${preview}` : ' · No text content'} `);
+          respondToTools(false, detail);
           consecutiveFailures++;
           if (consecutiveFailures >= 3) {
             addLog('error', 'Stopping after 3 invalid model actions. Check the provider response details before retrying.');
@@ -622,12 +549,12 @@ General Rules:
             isRunningRef.current = false;
             break;
           }
-          await new Promise(r => setTimeout(r, 2000));
+          await sleep(2000, signal);
           continue;
         }
 
         addLog('info', `Observation: ${action.observation}`);
-        
+
         let actionStr = `Action: ${action.action}`;
         if (action.action === 'evaluate') actionStr += ` (Executing JS: ${action.script})`;
         if (action.action === 'tap') actionStr += ` (Tapping at: ${action.x}, ${action.y})`;
@@ -635,150 +562,137 @@ General Rules:
         actionStr += ` (Reason: ${action.reason})`;
         addLog('action', actionStr);
 
+        const loopResult = updateLoopState(loopState, fingerprint, actionKey(action));
+        loopState = loopResult.state;
+
         if (action.action === 'done') {
           surveysCompletedThisRun++;
           setStats(prev => ({ ...prev, completed: prev.completed + 1 }));
           addLog('success', `Survey ${surveysCompletedThisRun}/${surveyGoal} completed!`);
-          
+          respondToTools(true, 'Survey completed.');
+
           if (surveysCompletedThisRun >= parseInt(surveyGoal)) {
             addLog('success', `Survey goal of ${surveyGoal} reached! Stopping agent.`);
             showSuccess(`Goal reached! Completed ${surveyGoal} surveys.`);
             break;
           }
-          
-          conversationHistory = [];
+
+          resetConversation();
           wsUrlRef.current = null;
           setWsUrl(null);
           webModeStartTime = null;
-          consecutiveFailures = 0;
-          await new Promise(r => setTimeout(r, 2000));
+          await sleep(2000, signal);
           continue;
         }
 
         let actionFailed = false;
-        
-        const currentActionString = JSON.stringify(action);
-        if (currentActionString === lastActionString && action.action !== 'wait') {
-          addLog('error', 'Agent repeated the exact same action as last time.');
+        let actionDetail = '';
+
+        if (loopResult.loop) {
+          loopStrikes++;
           actionFailed = true;
+          actionDetail = `Loop detected: ${loopResult.reason}`;
+          addLog('error', `Loop detected (${loopResult.reason}, strike ${loopStrikes}) for screen ${fingerprint}.`);
+          if (loopStrikes >= 2) {
+            respondToTools(false, actionDetail);
+            await exitSurvey('Repeated loop detected — returning to the survey list.');
+            continue;
+          }
+        } else {
+          loopStrikes = 0;
         }
-        lastActionString = currentActionString;
 
         if (!actionFailed) {
           if (action.action === 'evaluate' && action.script && mode === 'WEB') {
             addLog('info', 'Injecting script via WebSocket...');
             try {
-              await executeCDP(wsUrlRef.current!, action.script);
+              await executeCDP(wsUrlRef.current!, action.script, signal);
               consecutiveFailures = 0;
               webModeStartTime = null;
-              
-              await new Promise(r => setTimeout(r, 300));
-              try {
-                await executeCDP(wsUrlRef.current!, `
-                  var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-                  var inp = document.querySelector('[data-testid="question-input"]');
-                  if (inp && inp.value && inp.value.length > 0 && nativeSetter) {
-                    nativeSetter.call(inp, inp.value);
-                    inp.dispatchEvent(new Event('input', {bubbles: true}));
-                    setTimeout(() => { var btn = document.querySelector('[data-testid="submit-text"]'); if(btn) btn.click(); }, 300);
-                  } else {
-                    var submitBtn = document.querySelector('[data-testid="submit-text"]');
-                    if (submitBtn && !submitBtn.disabled) submitBtn.click();
-                  }
-                `);
-              } catch(e) {}
-              
-            } catch(e: any) {
-              addLog('error', `Script execution failed: ${e.message}`);
+              actionDetail = 'Script executed.';
+            } catch (error) {
+              if (isAbortError(error)) throw error;
+              addLog('error', `Script execution failed: ${error instanceof Error ? error.message : String(error)}`);
               actionFailed = true;
+              actionDetail = 'Script execution failed.';
             }
           } else if (action.action === 'tap' && action.x !== undefined && action.y !== undefined && mode === 'NATIVE') {
-            addLog('info', `Sending ADB Tap to ${action.x}, ${action.y}...`);
+            const tapPoint = { x: action.x, y: action.y };
+            addLog('info', `Sending ADB Tap to ${tapPoint.x}, ${tapPoint.y}...`);
             try {
-              const res = await fetch('/api/adb-tap', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ x: action.x, y: action.y }),
-              });
-              const data = await res.json();
-              if (!data.success) throw new Error(data.error);
-              
-              await new Promise(r => setTimeout(r, 500));
-              const nextXmlRes = await fetch('/api/dump-xml', { 
-                method: 'POST', 
-                headers: { 'Content-Type': 'application/json' }, 
-                body: JSON.stringify({})
-              });
-              const nextXmlData = await nextXmlRes.json();
-              
-              if (nextXmlData.success) {
-                const nextXml = nextXmlData.xml || '';
-                const nodeMatch = nextXml.match(/<node[^>]*(?:text|content-desc)="(?:Next|Submit)"[^>]*>/i);
-                if (nodeMatch) {
-                  const boundsMatch = nodeMatch[0].match(/bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/);
-                  if (boundsMatch) {
-                    const nx = Math.floor((parseInt(boundsMatch[1]) + parseInt(boundsMatch[3])) / 2);
-                    const ny = Math.floor((parseInt(boundsMatch[2]) + parseInt(boundsMatch[4])) / 2);
-                    addLog('info', `Auto-clicking Next/Submit at ${nx}, ${ny}`);
-                    await fetch('/api/adb-tap', { 
-                      method: 'POST', 
-                      headers: { 'Content-Type': 'application/json' }, 
-                      body: JSON.stringify({ x: nx, y: ny }) 
-                    });
-                  }
-                }
+              await tap(tapPoint.x, tapPoint.y, signal);
+              await sleep(500, signal);
+
+              let nextNodes: UiNode[] = [];
+              try {
+                nextNodes = parseUiNodes(await dumpXml(signal));
+              } catch (error) {
+                if (isAbortError(error)) throw error;
+              }
+              const nextButton = findNextButton(nextNodes);
+
+              if (nextButton && shouldAutoTapNext(tapPoint, nextButton)) {
+                addLog('info', `Auto-clicking ${nextButton.text || nextButton.desc} at ${nextButton.centerX}, ${nextButton.centerY}`);
+                await tap(nextButton.centerX, nextButton.centerY, signal);
+                actionDetail = `Tapped and then pressed ${nextButton.text || nextButton.desc}.`;
+              } else if (nextButton) {
+                addLog('debug', 'Skipping auto-Next because the tap already targeted the Next control.');
+                actionDetail = 'Tap already targeted the Next control; auto-tap guarded.';
+              } else {
+                actionDetail = 'Tap sent; no Next control found yet.';
               }
 
               consecutiveFailures = 0;
-            } catch(e: any) {
-              addLog('error', `ADB Tap failed: ${e.message}`);
+            } catch (error) {
+              if (isAbortError(error)) throw error;
+              addLog('error', `ADB Tap failed: ${error instanceof Error ? error.message : String(error)}`);
               actionFailed = true;
+              actionDetail = 'ADB tap failed.';
             }
           } else if (action.action === 'wait') {
             consecutiveFailures = 0;
+            actionDetail = 'Waited for the UI to settle.';
           }
         }
 
         if (actionFailed) {
+          respondToTools(false, actionDetail || 'Action failed.');
           consecutiveFailures++;
           if (consecutiveFailures >= 3) {
             addLog('error', 'Stuck on current survey (3 failures) — going back to survey list.');
-            try {
-              await fetch('/api/adb-keyevent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 4 }) });
-              await new Promise(r => setTimeout(r, 2000));
-              await fetch('/api/adb-tap', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x: 541, y: 1036 }) });
-              addLog('info', 'Confirmed survey exit.');
-            } catch (err) {}
-            wsUrlRef.current = null;
-            setWsUrl(null);
-            webModeStartTime = null;
-            conversationHistory = [];
-            consecutiveFailures = 0;
-            lastActionString = "";
+            await exitSurvey('Stuck on the current survey — returning to the survey list.');
             continue;
           }
+        } else {
+          respondToTools(true, actionDetail || 'Action sent.');
         }
 
         const waitTime = mode === 'WEB' ? 5000 : 3000;
         addLog('info', `Waiting for UI to settle (${waitTime / 1000}s)...`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
+        await sleep(waitTime, signal);
       }
-    } catch (error: any) {
-      console.error(error);
-      addLog('error', `Agent crashed: ${error.message}`);
-      showError('Agent encountered an error. Check logs.');
+    } catch (error) {
+      if (isAbortError(error)) {
+        addLog('info', 'Agent stopped.');
+      } else {
+        console.error(error);
+        addLog('error', `Agent crashed: ${error instanceof Error ? error.message : String(error)}`);
+        showError('Agent encountered an error. Check logs.');
+      }
     } finally {
       if (totalInputTokens > 0 || totalOutputTokens > 0) {
         addLog('success', `Session complete! Tokens: ${totalInputTokens} in / ${totalOutputTokens} out — Cost: $${totalCostUsd.toFixed(4)}`);
       }
       setIsRunning(false);
       isRunningRef.current = false;
+      if (abortControllerRef.current === controller) abortControllerRef.current = null;
     }
   };
 
   const stopAgent = () => {
     isRunningRef.current = false;
-    addLog('info', 'Stop requested. Finishing current cycle...');
+    abortControllerRef.current?.abort();
+    addLog('info', 'Stop requested. Aborting in-flight work immediately...');
   };
 
   return (

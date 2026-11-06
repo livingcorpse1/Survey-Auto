@@ -1,0 +1,13 @@
+{
+  "id": "attapoll",
+  "name": "AttaPoll",
+  "package": "com.requapp.requ",
+  "selection": "AttaPoll shows the estimated minutes and reward for each survey. Always pick the fastest survey available (lowest minutes). If two surveys have the same time, pick the higher paying one. Never start a survey estimated over 5 minutes. Avoid surveys whose title suggests a long diary or a follow-up study.",
+  "qualification": "Prefer neutral, low-consumption answers that qualify without contradicting earlier answers. Examples: 'None of the above', 'No', 'Never', 'I do not drink alcohol', 'I do not smoke'. Keep answers internally consistent for the whole session.",
+  "navigation": "AttaPoll starts surveys inside its own WebView. Once you have tapped a survey and the screen shows questions, you are already inside the survey: never go back to the list until the survey finishes or fails. Answer every question, then tap the on-screen Next/Submit control instead of swiping.",
+  "exit": "When AttaPoll reports a screen-out, quota full, or 'Sorry that didn't work out', dismiss the dialog with its close/back control and return to the survey list. Do not start the same survey again.",
+  "warnings": [
+    "Do not reload or restart the app while a survey is in progress.",
+    "If a reward confirmation appears, acknowledge it and return to the list."
+  ]
+}
