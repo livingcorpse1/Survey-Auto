@@ -76,7 +76,7 @@ export default defineConfig(({ mode }) => {
                 usage: { include: true },
               }),
             });
-            const data = await upstream.json();
+            const data: any = await upstream.json();
             res.statusCode = upstream.status;
             res.end(JSON.stringify({ success: upstream.ok, ...data }));
           } catch (e: any) {
@@ -191,7 +191,7 @@ export default defineConfig(({ mode }) => {
             console.log("[CDP Setup] Fetching DevTools pages...");
             const wsRes = await fetch('http://127.0.0.1:9222/json');
             if (!wsRes.ok) throw new Error("Failed to connect to local port 9222. Forwarding may have failed.");
-            const pages = await wsRes.json();
+            const pages = (await wsRes.json()) as any[];
 
             if (!pages || pages.length === 0) {
               throw new Error("No WebView pages detected. Is a WebView currently visible on screen?");
@@ -333,7 +333,21 @@ export default defineConfig(({ mode }) => {
         });
       });
 
-      // 6. Launch App Endpoint
+      // 6. Screen Size Endpoint
+      server.middlewares.use('/api/screen-size', async (req: any, res: any) => {
+        if (req.method !== 'GET') return req.next();
+        res.setHeader('Content-Type', 'application/json');
+        try {
+          const { stdout } = await runAdb(['shell', 'wm', 'size']);
+          res.end(JSON.stringify({ success: true, size: stdout.trim() }));
+        } catch (e: any) {
+          console.error(e);
+          res.statusCode = 500;
+          res.end(JSON.stringify({ success: false, error: e.message }));
+        }
+      });
+
+      // 7. Launch App Endpoint
       server.middlewares.use('/api/launch-app', (req: any, res: any) => {
         if (req.method !== 'POST') return req.next();
         let body = '';

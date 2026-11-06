@@ -1,0 +1,13 @@
+{
+  "id": "fivesurveys",
+  "name": "5Surveys",
+  "package": "com.fivesurveys.mobile",
+  "selection": "5Surveys does not show survey duration reliably. Prefer surveys with the lowest star rating (1-2 stars) because they tend to be shorter and simpler. Skip surveys whose title implies a long diary or multi-day follow-up.",
+  "qualification": "Qualification popups often render options as label, li, div, or span elements that have child elements; do not filter on children.length === 0. Match the exact visible text instead: Array.from(document.querySelectorAll('label, li, div, span')).find(el => el.innerText && el.innerText.trim() === 'EXACT_OPTION_TEXT')?.click(); then click Next in the same script. Pick the most neutral answer such as 'None of the above', 'No', or 'I do not consume alcohol'.",
+  "navigation": "5Surveys embeds survey questions in a WebView. Fill text answers with the native input setter, dispatch input and change events, blur the field, and click the submit/next control in the same script. Use document.getElementById for numeric ids instead of querySelector('#0').",
+  "exit": "If 5Surveys shows a 'leaving early' dialog, choose 'Lost interest' to confirm. Return to the survey list after any screen-out or quota message.",
+  "warnings": [
+    "Quest Mindshare surveys use css-175oi2r classes and React-controlled inputs; use the native value setter before dispatching events.",
+    "The text-answer widgets use data-testid=\"question-input\" and data-testid=\"submit-text\"."
+  ]
+}

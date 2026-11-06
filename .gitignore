@@ -33,3 +33,5 @@ dist-ssr
 .dyad/screenshot/
 .dyad/latest_screen.png
 .dyad/latest_ui.xml
+# TypeScript build info
+*.tsbuildinfo
