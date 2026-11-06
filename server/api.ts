@@ -1,6 +1,12 @@
 import { exec, execFile } from 'node:child_process';
 import path from 'node:path';
 import util from 'node:util';
+import {
+  buildModelCandidates,
+  isEmptyCompletion,
+  runWithModelFallback,
+  shouldRetryCompletion,
+} from '../src/lib/agent/retry';
 
 const execFileAsync = util.promisify(execFile);
 
@@ -99,24 +105,64 @@ export function registerApi(middlewares: ApiServer['middlewares'], state: ApiSta
       const { system, messages, max_tokens, tools, tool_choice } = await readJsonBody(req);
       if (typeof system !== 'string' || !Array.isArray(messages)) throw new Error('A system prompt and message history are required.');
       if (tools !== undefined && !Array.isArray(tools)) throw new Error('Tools must be an array.');
-      const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${state.openRouterApiKey}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': 'http://localhost:8080',
-          'X-Title': 'SurveyPilot',
+      const models = buildModelCandidates(state.openRouterModel, state.openRouterFallbackModel);
+      const result = await runWithModelFallback<{ status: number; data: any }>({
+        models,
+        attempt: async (model) => {
+          const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${state.openRouterApiKey}`,
+              'Content-Type': 'application/json',
+              'HTTP-Referer': 'http://localhost:8080',
+              'X-Title': 'SurveyPilot',
+            },
+            body: JSON.stringify({
+              model,
+              messages: [{ role: 'system', content: system }, ...messages],
+              max_tokens: Math.min(Math.max(Number(max_tokens) || 4096, 1), 4096),
+              ...(tools ? { tools, tool_choice: tool_choice || 'auto' } : {}),
+              usage: { include: true },
+            }),
+          });
+          let data: any = null;
+          try {
+            data = await upstream.json();
+          } catch {
+            data = null;
+          }
+          const empty = isEmptyCompletion(data);
+          return {
+            ok: upstream.ok && !empty,
+            value: { status: upstream.status, data },
+            status: upstream.status,
+            retryable: shouldRetryCompletion(upstream.status, data),
+            error: upstream.ok
+              ? 'OpenRouter returned an empty completion.'
+              : data?.error?.message || `OpenRouter request failed (${upstream.status}).`,
+          };
         },
-        body: JSON.stringify({
-          model: state.openRouterModel,
-          messages: [{ role: 'system', content: system }, ...messages],
-          max_tokens: Math.min(Math.max(Number(max_tokens) || 4096, 1), 4096),
-          ...(tools ? { tools, tool_choice: tool_choice || 'auto' } : {}),
-          usage: { include: true },
-        }),
+        onRetry: event => {
+          console.log(`[OpenRouter] ${event.model} attempt ${event.attempt} failed (${event.reason}); retrying in ${event.delayMs}ms.`);
+        },
       });
-      const data: any = await upstream.json();
-      sendJson(res, upstream.status, { success: upstream.ok, ...data });
+
+      if (!result.ok) {
+        sendJson(res, result.status && result.status >= 400 ? result.status : 502, {
+          success: false,
+          error: result.error,
+          attempts: result.attempts,
+        });
+        return;
+      }
+
+      sendJson(res, result.value.status, {
+        success: true,
+        ...result.value.data,
+        model: result.model,
+        attempts: result.attempts,
+        fallbackUsed: result.model !== state.openRouterModel,
+      });
     } catch (e: any) {
       sendJson(res, e.message?.startsWith('Set OPENROUTER_API_KEY') ? 503 : 502, { success: false, error: e.message });
     }
