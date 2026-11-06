@@ -254,6 +254,7 @@ export const AndroidAgent = () => {
     let loopState = createLoopState();
     let webModeStartTime: number | null = null;
     let deviceRecoveryAttempts = 0;
+    let transportFailures = 0;
     let surveyState = createSurveyState();
 
     const appName = APPS.find(a => a.package === appPackage)?.name || appPackage;
@@ -516,20 +517,40 @@ export const AndroidAgent = () => {
         pushUser(conversationHistory, userText);
         conversationHistory = pruneHistory(conversationHistory, DEFAULT_HISTORY_WINDOW_STEPS);
 
-        const responseRes = await abortableFetch('/api/openrouter/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            system: systemPrompt,
-            max_tokens: 4096,
-            tools: actionTools,
-            tool_choice: { type: 'function', function: { name: 'submit_android_action' } },
-            messages: toChatMessages(conversationHistory),
-          }),
-        }, signal);
-        const response = await responseRes.json();
-        if (!responseRes.ok || !response.success) {
-          throw new Error(response.error?.message || response.error || `OpenRouter request failed (${responseRes.status}).`);
+        let response: any;
+        try {
+          const responseRes = await abortableFetch('/api/openrouter/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              system: systemPrompt,
+              max_tokens: 4096,
+              tools: actionTools,
+              tool_choice: { type: 'function', function: { name: 'submit_android_action' } },
+              messages: toChatMessages(conversationHistory),
+            }),
+          }, signal);
+          response = await responseRes.json();
+          if (!responseRes.ok || !response.success) {
+            throw new Error(response.error?.message || response.error || `OpenRouter request failed (${responseRes.status}).`);
+          }
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          transportFailures += 1;
+          const message = error instanceof Error ? error.message : String(error);
+          addLog('error', `OpenRouter request failed (${transportFailures}/8): ${message}`);
+          if (transportFailures >= 8) {
+            addLog('error', 'Stopping after 8 consecutive model request failures.');
+            showError('The model provider failed 8 times in a row. The agent was stopped.');
+            isRunningRef.current = false;
+            break;
+          }
+          await sleep(2500, signal);
+          continue;
+        }
+        transportFailures = 0;
+        if (response.fallbackUsed || (response.attempts ?? 1) > 1) {
+          addLog('info', `OpenRouter used ${response.model ?? openRouterModel} after ${response.attempts} attempt(s).`);
         }
 
         if (response.usage) {
