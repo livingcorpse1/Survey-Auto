@@ -9,7 +9,7 @@ import {
   shouldRetryCompletion,
 } from '../src/lib/agent/retry';
 import { inspectDeviceStatus } from '../src/lib/agent/device';
-import { DEFAULT_CDP_PORT, isAllowedDevToolsUrl } from '../src/lib/agent/cdp';
+import { DEFAULT_CDP_PORT, fetchDevToolsPages, isAllowedDevToolsUrl } from '../src/lib/agent/cdp';
 
 const execFileAsync = util.promisify(execFile);
 
@@ -304,14 +304,17 @@ export function registerApi(middlewares: ApiServer['middlewares'], state: ApiSta
 
       await new Promise(r => setTimeout(r, 1500));
 
-      console.log('[CDP Setup] Fetching DevTools pages...');
-      const wsRes = await fetch('http://127.0.0.1:9222/json');
-      if (!wsRes.ok) throw new Error('Failed to connect to local port 9222. Forwarding may have failed.');
-      const pages = (await wsRes.json()) as any[];
-
-      if (!pages || pages.length === 0) {
-        throw new Error('No WebView pages detected. Is a WebView currently visible on screen?');
+      console.log('[CDP Setup] Fetching DevTools pages (retrying until the forward answers)...');
+      let dump = await fetchDevToolsPages(fetch, DEFAULT_CDP_PORT);
+      for (let attempt = 1; attempt < 3 && !dump.success; attempt++) {
+        console.log(`[CDP Setup] DevTools not ready (attempt ${attempt}/3): ${dump.error}`);
+        await new Promise(r => setTimeout(r, 1500));
+        dump = await fetchDevToolsPages(fetch, DEFAULT_CDP_PORT);
       }
+      if (!dump.success) {
+        throw new Error(dump.error || 'Failed to connect to local port 9222. Forwarding may have failed.');
+      }
+      const pages = dump.pages;
 
       let wsUrl = pages[0].webSocketDebuggerUrl;
       for (const page of pages) {
