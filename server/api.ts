@@ -7,6 +7,7 @@ import {
   runWithModelFallback,
   shouldRetryCompletion,
 } from '../src/lib/agent/retry';
+import { inspectDeviceStatus } from '../src/lib/agent/device';
 
 const execFileAsync = util.promisify(execFile);
 
@@ -178,6 +179,54 @@ export function registerApi(middlewares: ApiServer['middlewares'], state: ApiSta
       sendJson(res, 200, { success: true, devices, selectedSerial });
     } catch (e: any) {
       sendJson(res, 500, { success: false, error: e.message });
+    }
+  });
+
+  // Watchdog used by the agent before each step: verify the target is still online
+  // and reconnect a dropped BlueStacks/emulator adb bridge when it can.
+  middlewares.use('/api/adb-ensure', async (req: any, res: any) => {
+    if (req.method !== 'POST') return req.next?.();
+    try {
+      const body = await readJsonBody(req);
+      const serial = typeof body.serial === 'string' ? body.serial.trim() : state.activeSerial;
+      const address = typeof body.address === 'string' && body.address.trim()
+        ? body.address.trim()
+        : state.bluestacksAddress;
+      const readStatus = async () => {
+        const { stdout } = await execFileAsync(state.adb, ['devices', '-l'], { windowsHide: true });
+        return inspectDeviceStatus(stdout, serial, address);
+      };
+
+      let status = await readStatus();
+      let reconnected = false;
+      let connectOutput = '';
+
+      if (status.recoveryReason && status.reconnectTarget) {
+        try {
+          const { stdout, stderr } = await execFileAsync(
+            state.adb,
+            ['connect', status.reconnectTarget],
+            { windowsHide: true, timeout: 10_000 },
+          );
+          connectOutput = `${stdout}${stderr}`.trim();
+          reconnected = /connected to/i.test(connectOutput) && !/unable to connect|failed to connect|cannot connect/i.test(connectOutput);
+        } catch (e: any) {
+          connectOutput = e.message;
+        }
+        if (reconnected) {
+          await new Promise(resolve => setTimeout(resolve, 1200));
+          status = await readStatus();
+        }
+      }
+
+      sendJson(res, 200, {
+        success: status.recoveryReason === null,
+        reconnected,
+        connectOutput,
+        ...status,
+      });
+    } catch (e: any) {
+      sendJson(res, 502, { success: false, error: e.message });
     }
   });
 
