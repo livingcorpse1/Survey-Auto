@@ -547,7 +547,7 @@ General Rules:
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             system: systemPrompt,
-            max_tokens: 512,
+            max_tokens: 4096,
             tools: actionTools,
             tool_choice: { type: 'function', function: { name: 'submit_android_action' } },
             messages: conversationHistory.map((message: any) => ({
@@ -610,7 +610,9 @@ General Rules:
           if (action.action === 'tap' && mode !== 'NATIVE') throw new Error('Tap actions can only be used in NATIVE mode');
           consecutiveFailures = 0;
         } catch (e) {
-          const detail = e instanceof Error ? e.message : 'Unknown action parse error';
+          const detail = choice?.finish_reason === 'length'
+            ? 'Response hit the token limit before returning an action'
+            : e instanceof Error ? e.message : 'Unknown action parse error';
           const preview = responseText.replace(/\s+/g, ' ').slice(0, 180);
           addLog('error', `Invalid model action (${choice?.finish_reason || 'no finish reason'}): ${detail}${preview ? ` · Reply: ${preview}` : ' · No text content'} `);
           consecutiveFailures++;

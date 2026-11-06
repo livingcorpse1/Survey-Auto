@@ -71,7 +71,7 @@ export default defineConfig(({ mode }) => {
               body: JSON.stringify({
                 model: OPENROUTER_MODEL,
                 messages: [{ role: 'system', content: system }, ...messages],
-                max_tokens: Math.min(Math.max(Number(max_tokens) || 512, 1), 2048),
+                max_tokens: Math.min(Math.max(Number(max_tokens) || 4096, 1), 4096),
                 ...(tools ? { tools, tool_choice: tool_choice || 'auto' } : {}),
                 usage: { include: true },
               }),
