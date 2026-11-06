@@ -1,4 +1,5 @@
-import { exec, execFile } from 'node:child_process';
+import { exec, execFile, spawn } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import util from 'node:util';
 import {
@@ -22,6 +23,7 @@ export interface ApiState {
   openRouterModel: string;
   openRouterFallbackModel: string;
   bluestacksAddress: string;
+  scrcpyExe: string;
 }
 
 export interface ApiServer {
@@ -39,6 +41,7 @@ export function createApiState(env: ServerEnv): ApiState {
     openRouterModel: env.OPENROUTER_MODEL?.trim() || 'nvidia/nemotron-3-ultra-550b-a55b:free',
     openRouterFallbackModel: env.OPENROUTER_MODEL_FALLBACK?.trim() || '',
     bluestacksAddress: env.BLUESTACKS_ADDRESS?.trim() || '127.0.0.1:5555',
+    scrcpyExe: env.SCRCPY_DIR?.trim() ? path.join(env.SCRCPY_DIR.trim(), 'scrcpy.exe') : '',
   };
 }
 
@@ -455,10 +458,17 @@ export function registerApi(middlewares: ApiServer['middlewares'], state: ApiSta
   middlewares.use('/api/run-scrcpy', async (req: any, res: any) => {
     if (req.method !== 'POST') return req.next?.();
     try {
-      const { directory, appPackage } = await readJsonBody(req);
-      const scrcpyExe = path.join(directory, 'scrcpy.exe');
+      const { appPackage } = await readJsonBody(req);
+      if (!state.scrcpyExe) {
+        sendJson(res, 503, { success: false, error: 'SCRCPY_DIR is not set in .env. Configure the scrcpy folder and restart SurveyPilot.' });
+        return;
+      }
+      if (!fs.existsSync(state.scrcpyExe)) {
+        sendJson(res, 503, { success: false, error: `scrcpy.exe not found at ${state.scrcpyExe}` });
+        return;
+      }
 
-      const child = exec(`"${scrcpyExe}" --new-display`);
+      const child = spawn(state.scrcpyExe, ['--new-display'], { detached: true, stdio: 'ignore', windowsHide: true });
       child.unref();
 
       if (appPackage) {
