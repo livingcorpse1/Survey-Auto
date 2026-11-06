@@ -8,6 +8,7 @@ import {
   shouldRetryCompletion,
 } from '../src/lib/agent/retry';
 import { inspectDeviceStatus } from '../src/lib/agent/device';
+import { DEFAULT_CDP_PORT, isAllowedDevToolsUrl } from '../src/lib/agent/cdp';
 
 const execFileAsync = util.promisify(execFile);
 
@@ -318,6 +319,9 @@ export function registerApi(middlewares: ApiServer['middlewares'], state: ApiSta
       }
 
       if (!wsUrl) throw new Error('Could not find a valid WebSocket URL from DevTools.');
+      if (!isAllowedDevToolsUrl(wsUrl, DEFAULT_CDP_PORT)) {
+        throw new Error('DevTools returned a non-loopback WebSocket URL; refusing to expose it.');
+      }
 
       console.log(`[CDP Setup] Success! WebSocket URL: ${wsUrl}`);
       sendJson(res, 200, { success: true, wsUrl });
@@ -332,6 +336,10 @@ export function registerApi(middlewares: ApiServer['middlewares'], state: ApiSta
     if (req.method !== 'POST') return req.next?.();
     try {
       const { wsUrl, script } = await readJsonBody(req);
+      if (!isAllowedDevToolsUrl(wsUrl, DEFAULT_CDP_PORT)) {
+        sendJson(res, 400, { success: false, error: 'CDP URL must be a loopback DevTools WebSocket (127.0.0.1:9222).' });
+        return;
+      }
       const WebSocket = (await import('ws')).default;
 
       const ws = new WebSocket(wsUrl);
