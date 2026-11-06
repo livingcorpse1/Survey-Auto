@@ -1,5 +1,11 @@
-import { describe, expect, it } from 'vitest';
-import { isAllowedDevToolsUrl, isLoopbackHost, parseDevToolsUrl } from '@/lib/agent/cdp';
+import { describe, expect, it, vi } from 'vitest';
+import {
+  fetchDevToolsPages,
+  isAllowedDevToolsUrl,
+  isLoopbackHost,
+  parseDevToolsUrl,
+  validateDevToolsPages,
+} from '@/lib/agent/cdp';
 
 const GOOD_URL = 'ws://127.0.0.1:9222/devtools/page/3E2FE2A1B2C3D4E5F6A7B8C9D0E1F2A';
 
@@ -47,6 +53,45 @@ describe('cdp url helpers', () => {
       isDevTools: true,
     });
     expect(parseDevToolsUrl('ws://192.168.1.1:9222/devtools/page/abc').isDevTools).toBe(true);
+  });
+
+  it('validates page lists', () => {
+    expect(validateDevToolsPages([{ type: 'page', webSocketDebuggerUrl: GOOD_URL }]).success).toBe(true);
+    expect(validateDevToolsPages('nope').success).toBe(false);
+    expect(validateDevToolsPages([]).success).toBe(false);
+    expect(validateDevToolsPages([{ type: 'page' }]).success).toBe(false);
+  });
+
+  it('times out bad reads instead of hanging', async () => {
+    const hanging = vi.fn().mockImplementation(() => new Promise(() => {}));
+    const result = await fetchDevToolsPages(hanging as any, undefined, 20);
+    expect(result).toEqual({
+      success: false,
+      pages: [],
+      error: 'Timed out waiting for DevTools on port 9222.',
+      timedOut: true,
+    });
+  });
+
+  it('reports network errors immediately', async () => {
+    const failing = vi.fn().mockRejectedValue(new Error('connection refused'));
+    const result = await fetchDevToolsPages(failing as any, undefined, 50);
+    expect(result).toEqual({
+      success: false,
+      pages: [],
+      error: 'Could not reach DevTools on port 9222. Forwarding may have failed.',
+      timedOut: false,
+    });
+  });
+
+  it('parses a good DevTools list', async () => {
+    const ok = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [{ type: 'page', webSocketDebuggerUrl: GOOD_URL }],
+    });
+    const result = await fetchDevToolsPages(ok as any);
+    expect(result.success).toBe(true);
+    expect(result.pages).toHaveLength(1);
   });
 
   it('recognizes loopback hosts', () => {
