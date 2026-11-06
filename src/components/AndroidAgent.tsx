@@ -4,6 +4,7 @@ import { showSuccess, showError } from '@/utils/toast';
 import { cn } from '@/lib/utils';
 import type { AdbDevice, AgentAction, ChatMessage, LogEntry, ScreenSize, UiNode } from '@/lib/agent/types';
 import { appendLogEntry } from '@/lib/agent/logs';
+import { redactLogMessage } from '@/lib/agent/redact';
 import { abortableFetch, isAbortError, sleep, throwIfAborted } from '@/lib/agent/abort';
 import { buildNativeContext, deriveScreenSize, findNextButton, fnv1aHash, parseUiNodes } from '@/lib/agent/xml';
 import { parseWmSize, resolveExitTap } from '@/lib/agent/screen';
@@ -66,7 +67,7 @@ export const AndroidAgent = () => {
       id: Math.random().toString(36).substring(7),
       time: new Date().toLocaleTimeString(),
       type,
-      message
+      message: redactLogMessage(message)
     }));
   };
 
