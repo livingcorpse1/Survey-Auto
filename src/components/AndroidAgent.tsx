@@ -375,12 +375,18 @@ export const AndroidAgent = () => {
             } catch (error) {
               if (isAbortError(error)) throw error;
               cdpRetryCount++;
-              if (cdpRetryCount >= 3) {
-                addLog('error', 'CDP Setup failed 3 times. Survey may not support WebView debugging. Skipping.');
-                setStats(prev => ({ ...prev, cdpFailed: prev.cdpFailed + 1 }));
+              if (cdpRetryCount >= 1) {
+                addLog('error', `CDP unavailable (${error instanceof Error ? error.message : String(error)}); continuing in native XML mode.`);
                 cdpRetryCount = 0;
                 webModeStartTime = null;
-                await exitSurvey('Skipping survey after repeated CDP failures.');
+                setStats(prev => ({ ...prev, cdpFailed: prev.cdpFailed + 1 }));
+                wsUrlRef.current = null;
+                setWsUrl(null);
+                const context = buildNativeContext(rawXml);
+                const screen = screenSizeRef.current ?? context.screen;
+                fingerprint = context.fingerprint;
+                setPageText(`// NATIVE UI DETECTED (CDP unavailable, falling back)\n\nScreen: ${screen.width}x${screen.height}\n\n${context.text}`);
+                userText = `Current Mode: NATIVE (CDP unavailable, answer via taps/type)\nGoal: ${goal}\nScreen: ${screen.width}x${screen.height}\n\nInteractive UI nodes (${context.shownCount}/${context.totalCount} shown):\n${context.text}\n\nTap answer buttons; for text fields use action type with x,y and the text to type.`;
                 continue;
               }
               addLog('error', `CDP Setup Failed (Attempt ${cdpRetryCount}/3): ${error instanceof Error ? error.message : String(error)}`);
