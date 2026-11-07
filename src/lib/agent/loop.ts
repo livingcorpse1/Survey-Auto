@@ -29,8 +29,9 @@ export function createLoopState(): LoopState {
   };
 }
 
-export function actionKey(action: Pick<AgentAction, 'action' | 'x' | 'y' | 'script'>): string {
+export function actionKey(action: Pick<AgentAction, 'action' | 'x' | 'y' | 'script' | 'text'>): string {
   if (action.action === 'tap') return `tap:${action.x},${action.y}`;
+  if (action.action === 'type') return `type:${action.text ?? ''}`;
   if (action.action === 'evaluate') return `evaluate:${(action.script || '').replace(/\s+/g, ' ').trim()}`;
   return action.action;
 }

@@ -179,6 +179,8 @@ export const AndroidAgent = () => {
 
   const tap = (x: number, y: number, signal?: AbortSignal) => postJson('/api/adb-tap', { x, y }, signal);
 
+  const typeText = (text: string, signal?: AbortSignal) => postJson('/api/adb-type-text', { text }, signal);
+
   const sendBack = (signal?: AbortSignal) => postJson('/api/adb-keyevent', { key: 4 }, signal);
 
   const refreshScreenSize = async (signal?: AbortSignal) => {
@@ -294,9 +296,10 @@ export const AndroidAgent = () => {
             type: 'object',
             properties: {
               observation: { type: 'string', description: 'Brief description of the visible screen and target.' },
-              action: { type: 'string', enum: ['tap', 'evaluate', 'wait', 'done'] },
+              action: { type: 'string', enum: ['tap', 'type', 'evaluate', 'wait', 'done'] },
               x: { type: 'integer', description: 'Tap x coordinate for native mode.' },
               y: { type: 'integer', description: 'Tap y coordinate for native mode.' },
+              text: { type: 'string', description: 'Text to type for action "type" (e.g. an age number).' },
               script: { type: 'string', description: 'JavaScript to evaluate in WebView mode.' },
               reason: { type: 'string', description: 'Why this action is appropriate.' },
             },
@@ -524,16 +527,23 @@ export const AndroidAgent = () => {
             if (!jsonCandidate || jsonCandidate === responseText && !responseText.includes('{')) throw new Error('No action tool call or JSON object found');
             action = JSON.parse(jsonCandidate);
           }
-          if (!action || !['tap', 'evaluate', 'wait', 'done'].includes(action.action) || typeof action.observation !== 'string' || typeof action.reason !== 'string') {
+          if (!action || !['tap', 'type', 'evaluate', 'wait', 'done'].includes(action.action) || typeof action.observation !== 'string' || typeof action.reason !== 'string') {
             throw new Error('Action is missing required fields or has an unsupported action type');
           }
           if (action.action === 'tap' && (!Number.isFinite(action.x) || !Number.isFinite(action.y) || action.x < 0 || action.y < 0)) {
             throw new Error('Tap actions require non-negative numeric x and y coordinates');
           }
+          if (action.action === 'type' && (
+            !Number.isFinite(action.x) || !Number.isFinite(action.y) || action.x < 0 || action.y < 0
+            || typeof action.text !== 'string' || action.text.length === 0 || action.text.length > 256
+          )) {
+            throw new Error('Type actions require non-negative numeric x and y and a text to type');
+          }
           if (action.action === 'evaluate' && (typeof action.script !== 'string' || mode !== 'WEB')) {
             throw new Error('Evaluate actions require a script and WEB mode');
           }
           if (action.action === 'tap' && mode !== 'NATIVE') throw new Error('Tap actions can only be used in NATIVE mode');
+          if (action.action === 'type' && mode !== 'NATIVE') throw new Error('Type actions can only be used in NATIVE mode');
           consecutiveFailures = 0;
         } catch (error) {
           const detail = choice?.finish_reason === 'length'
@@ -558,6 +568,7 @@ export const AndroidAgent = () => {
         let actionStr = `Action: ${action.action}`;
         if (action.action === 'evaluate') actionStr += ` (Executing JS: ${action.script})`;
         if (action.action === 'tap') actionStr += ` (Tapping at: ${action.x}, ${action.y})`;
+        if (action.action === 'type') actionStr += ` (Typing at: ${action.x}, ${action.y})`;
         if (action.action === 'wait') actionStr += ` (Waiting for changes)`;
         actionStr += ` (Reason: ${action.reason})`;
         addLog('action', actionStr);
@@ -648,6 +659,37 @@ export const AndroidAgent = () => {
               addLog('error', `ADB Tap failed: ${error instanceof Error ? error.message : String(error)}`);
               actionFailed = true;
               actionDetail = 'ADB tap failed.';
+            }
+          } else if (action.action === 'type' && action.x !== undefined && action.y !== undefined && action.text && mode === 'NATIVE') {
+            const fieldPoint = { x: action.x, y: action.y };
+            addLog('info', `Focusing field at ${fieldPoint.x}, ${fieldPoint.y} and typing...`);
+            try {
+              await tap(fieldPoint.x, fieldPoint.y, signal);
+              await sleep(600, signal);
+              await typeText(action.text, signal);
+              await sleep(500, signal);
+
+              let nextNodes: UiNode[] = [];
+              try {
+                const nextXml = await dumpXml(signal);
+                nextNodes = parseUiNodes(nextXml);
+              } catch (error) {
+                if (isAbortError(error)) throw error;
+              }
+              const nextButton = findNextButton(nextNodes);
+              if (nextButton) {
+                addLog('info', `Auto-clicking Next at ${nextButton.centerX}, ${nextButton.centerY} after typing.`);
+                await tap(nextButton.centerX, nextButton.centerY, signal);
+                actionDetail = `Typed "${action.text}" and pressed Next.`;
+              } else {
+                actionDetail = `Typed "${action.text}"; no Next control found yet.`;
+              }
+              consecutiveFailures = 0;
+            } catch (error) {
+              if (isAbortError(error)) throw error;
+              addLog('error', `Typing failed: ${error instanceof Error ? error.message : String(error)}`);
+              actionFailed = true;
+              actionDetail = 'Typing failed.';
             }
           } else if (action.action === 'wait') {
             consecutiveFailures = 0;
