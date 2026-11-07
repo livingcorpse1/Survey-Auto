@@ -21,7 +21,7 @@ export function getPlaybook(packageName: string): Playbook {
       name: packageName,
       package: packageName,
       selection:
-        'Pick the fastest survey available. If duration is shown, prefer the lowest duration and skip anything over 5 minutes. If duration is not shown, prefer simple 1-2 star surveys.',
+        'Pick the fastest unlocked survey available. If a card shows "Unlock" or any lock/upgrade/profiling state, skip it — locked cards cannot be started. If duration is shown, prefer the lowest duration and skip anything over 5 minutes. If duration is not shown, prefer higher reward or simpler 1-2 star surveys — never infer speed from question count.',
       qualification:
         'Answer qualification questions with neutral, low-consumption options and keep answers consistent for the whole session.',
       navigation:

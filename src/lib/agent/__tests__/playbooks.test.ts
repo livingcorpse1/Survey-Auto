@@ -36,4 +36,17 @@ describe('playbooks', () => {
     const playbook = { ...getPlaybook('com.attapoll.app'), warnings: ['Never reload during a survey.'] };
     expect(buildSystemPrompt(playbook)).toContain('Never reload during a survey.');
   });
+
+  it('instructs the AttaPoll agent to never tap locked survey cards', () => {
+    const playbook = getPlaybook('com.requapp.requ');
+    expect(playbook.selection).toContain('Unlock surveys');
+    expect(playbook.selection).toContain('NEVER tap a card');
+    expect(buildSystemPrompt(playbook)).toContain('Unlock surveys');
+  });
+
+  it('keeps selection grounded in explicit card facts', () => {
+    const playbook = getPlaybook('com.requapp.requ');
+    expect(playbook.selection).not.toContain('fewest questions');
+    expect(playbook.selection).toContain('Never guess speed from question count');
+  });
 });
