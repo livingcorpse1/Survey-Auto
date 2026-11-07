@@ -39,6 +39,8 @@ export default defineConfig(({ mode }) => {
     return execFileAsync(ADB, ['-s', serial, ...args], { windowsHide: true });
   };
 
+  const runAdbRaw = async (args: string[]) => execFileAsync(ADB, args, { windowsHide: true });
+
   const cdpPlugin = () => ({
     name: 'cdp-plugin',
     configureServer(server: any) {
@@ -305,6 +307,31 @@ export default defineConfig(({ mode }) => {
             const { key } = JSON.parse(body);
             console.log(`[ADB Keyevent] Sending keyevent ${key}`);
             await runAdb(['shell', 'input', 'keyevent', String(key)]);
+            res.end(JSON.stringify({ success: true }));
+          } catch (e: any) {
+            console.error(e);
+            res.statusCode = 500;
+            res.end(JSON.stringify({ success: false, error: e.message }));
+          }
+        });
+      });
+
+      // 4b. Type Text Endpoint (for text-input survey questions)
+      server.middlewares.use('/api/adb-type-text', (req: any, res: any) => {
+        if (req.method !== 'POST') return req.next();
+        let body = '';
+        req.on('data', (chunk: any) => { body += chunk.toString(); });
+        req.on('end', async () => {
+          res.setHeader('Content-Type', 'application/json');
+          try {
+            const { text } = JSON.parse(body);
+            const value = String(text ?? '').replace(/\s+/g, '');
+            if (!value) throw new Error('Text is required.');
+            if (value.length > 256) throw new Error('Text too long.');
+            if (!/^[A-Za-z0-9._@+\-]*$/.test(value)) throw new Error('Text contains characters adb input cannot type safely.');
+            console.log(`[ADB Type] Typing ${value.length} chars`);
+            const serial = await resolveSerial();
+            await runAdbRaw(['-s', serial, 'shell', 'input', 'text', value]);
             res.end(JSON.stringify({ success: true }));
           } catch (e: any) {
             console.error(e);
