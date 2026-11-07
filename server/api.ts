@@ -8,6 +8,7 @@ import {
   shouldRetryCompletion,
 } from '../src/lib/agent/retry';
 import { inspectDeviceStatus } from '../src/lib/agent/device';
+import { DEFAULT_CDP_PORT, fetchDevToolsPages, isAllowedDevToolsUrl } from '../src/lib/agent/cdp';
 
 const execFileAsync = util.promisify(execFile);
 
@@ -283,6 +284,16 @@ export function registerApi(middlewares: ApiServer['middlewares'], state: ApiSta
 
       console.log('[CDP Setup] Starting frida-server...');
       await runAdb(state, ['shell', 'su', '-c', '/data/local/tmp/frida-server >/dev/null 2>&1 &']).catch(() => {});
+      try {
+        const { stdout: psOut2 } = await runAdb(state, ['shell', 'ps', '-e']);
+        if (!psOut2.includes('frida-server')) {
+          console.log('[CDP Setup] frida-server not running; starting without su...');
+          await runAdb(state, ['shell', 'nohup', '/data/local/tmp/frida-server', '>/dev/null', '2>&1', '&']).catch(() => {});
+          await new Promise(r => setTimeout(r, 1200));
+        }
+      } catch {
+        console.log('[CDP Setup] frida-server start check failed; continuing with forward anyway...');
+      }
 
       console.log('[CDP Setup] Injecting WebView debug flag via Frida...');
       try {
@@ -300,14 +311,22 @@ export function registerApi(middlewares: ApiServer['middlewares'], state: ApiSta
 
       await new Promise(r => setTimeout(r, 1500));
 
-      console.log('[CDP Setup] Fetching DevTools pages...');
-      const wsRes = await fetch('http://127.0.0.1:9222/json');
-      if (!wsRes.ok) throw new Error('Failed to connect to local port 9222. Forwarding may have failed.');
-      const pages = (await wsRes.json()) as any[];
-
-      if (!pages || pages.length === 0) {
-        throw new Error('No WebView pages detected. Is a WebView currently visible on screen?');
+      console.log('[CDP Setup] Fetching DevTools pages (retrying until the forward answers)...');
+      let dump = await fetchDevToolsPages(fetch, DEFAULT_CDP_PORT);
+      for (let attempt = 1; attempt < 3 && !dump.success; attempt++) {
+        console.log(`[CDP Setup] DevTools not ready (attempt ${attempt}/3): ${dump.error}`);
+        // Stale forwards (tunnel bound but target socket gone) hang the
+        // fetch until timeout. Re-creating the forward in between attempts
+        // is the only thing that clears them.
+        await runAdb(state, ['forward', '--remove', 'tcp:9222']).catch(() => {});
+        await runAdb(state, ['forward', 'tcp:9222', `localabstract:webview_devtools_remote_${pid}`]).catch(() => {});
+        await new Promise(r => setTimeout(r, 1500));
+        dump = await fetchDevToolsPages(fetch, DEFAULT_CDP_PORT);
       }
+      if (!dump.success) {
+        throw new Error(dump.error || 'Failed to connect to local port 9222. Forwarding may have failed.');
+      }
+      const pages = dump.pages;
 
       let wsUrl = pages[0].webSocketDebuggerUrl;
       for (const page of pages) {
@@ -332,6 +351,10 @@ export function registerApi(middlewares: ApiServer['middlewares'], state: ApiSta
     if (req.method !== 'POST') return req.next?.();
     try {
       const { wsUrl, script } = await readJsonBody(req);
+      if (!isAllowedDevToolsUrl(wsUrl, DEFAULT_CDP_PORT)) {
+        sendJson(res, 400, { success: false, error: 'CDP URL must be a loopback DevTools WebSocket (127.0.0.1:9222).' });
+        return;
+      }
       const WebSocket = (await import('ws')).default;
 
       const ws = new WebSocket(wsUrl);
