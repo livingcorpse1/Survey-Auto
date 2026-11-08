@@ -252,6 +252,22 @@ export const AndroidAgent = () => {
       consecutiveFailures = 0;
     };
 
+    const forceBackToList = async (message: string) => {
+      addLog('info', message);
+      try {
+        await postJson('/api/launch-app', { appPackage }, signal);
+        await sleep(1500, signal);
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        addLog('error', `Failed to relaunch app: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      wsUrlRef.current = null;
+      setWsUrl(null);
+      webModeStartTime = null;
+      resetConversation();
+      await sleep(1500, signal);
+    };
+
     const exitSurvey = async (message: string) => {
       addLog('info', message);
       try {
@@ -631,7 +647,7 @@ export const AndroidAgent = () => {
           addLog('error', `Loop detected (${loopResult.reason}, strike ${loopStrikes}) for screen ${fingerprint}.`);
           if (loopStrikes >= 2) {
             respondToTools(false, actionDetail);
-            await exitSurvey('Repeated loop detected — returning to the survey list.');
+            await forceBackToList('Repeated loop detected — forcing back to the survey list.');
             continue;
           }
         } else {
