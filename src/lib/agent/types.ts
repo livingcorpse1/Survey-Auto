@@ -11,13 +11,14 @@ export interface AdbDevice {
   details: string;
 }
 
-export type ActionType = 'tap' | 'evaluate' | 'wait' | 'done';
+export type ActionType = 'tap' | 'type' | 'evaluate' | 'wait' | 'done';
 
 export interface AgentAction {
   observation: string;
   action: ActionType;
   x?: number;
   y?: number;
+  text?: string;
   script?: string;
   reason: string;
 }
