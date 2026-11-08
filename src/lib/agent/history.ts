@@ -1,23 +1,24 @@
 import type { ChatMessage, ChatToolCall } from './types';
+import { redactText } from './redact';
 
 export const DEFAULT_HISTORY_WINDOW_STEPS = 8;
 
 export function pushUser(history: ChatMessage[], content: string): void {
-  history.push({ role: 'user', content });
+  history.push({ role: 'user', content: redactText(content) });
 }
 
 export function pushAssistant(
   history: ChatMessage[],
   message: { content?: string | null; tool_calls?: ChatToolCall[] },
 ): void {
-  const content = typeof message.content === 'string' && message.content.trim() !== '' ? message.content : null;
+  const content = typeof message.content === 'string' && message.content.trim() !== '' ? redactText(message.content) : null;
   const entry: ChatMessage = { role: 'assistant', content };
   if (message.tool_calls && message.tool_calls.length > 0) entry.tool_calls = message.tool_calls;
   history.push(entry);
 }
 
 export function pushToolResult(history: ChatMessage[], toolCallId: string, content: string): void {
-  history.push({ role: 'tool', tool_call_id: toolCallId, content });
+  history.push({ role: 'tool', tool_call_id: toolCallId, content: redactText(content) });
 }
 
 export function countSteps(history: ChatMessage[]): number {

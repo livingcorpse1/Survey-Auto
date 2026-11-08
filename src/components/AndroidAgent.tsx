@@ -4,11 +4,14 @@ import { showSuccess, showError } from '@/utils/toast';
 import { cn } from '@/lib/utils';
 import type { AdbDevice, AgentAction, ChatMessage, LogEntry, ScreenSize, UiNode } from '@/lib/agent/types';
 import { appendLogEntry } from '@/lib/agent/logs';
+import { redactLogMessage } from '@/lib/agent/redact';
 import { abortableFetch, isAbortError, sleep, throwIfAborted } from '@/lib/agent/abort';
 import { buildNativeContext, deriveScreenSize, findNextButton, fnv1aHash, parseUiNodes } from '@/lib/agent/xml';
 import { parseWmSize, resolveExitTap } from '@/lib/agent/screen';
 import { actionKey, createLoopState, updateLoopState } from '@/lib/agent/loop';
 import { shouldAutoTapNext } from '@/lib/agent/taps';
+import { diffScreen } from '@/lib/agent/verify';
+import { checkSurveyBudget, createSurveyState, recordSurveyStep } from '@/lib/agent/survey';
 import { buildSystemPrompt, getPlaybook } from '@/lib/agent/playbooks';
 import {
   DEFAULT_HISTORY_WINDOW_STEPS,
@@ -64,7 +67,7 @@ export const AndroidAgent = () => {
       id: Math.random().toString(36).substring(7),
       time: new Date().toLocaleTimeString(),
       type,
-      message
+      message: redactLogMessage(message)
     }));
   };
 
@@ -177,6 +180,20 @@ export const AndroidAgent = () => {
     return typeof data.xml === 'string' ? data.xml : '';
   };
 
+  const ensureDevice = async (signal?: AbortSignal) => {
+    const res = await abortableFetch('/api/adb-ensure', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ serial: selectedDevice }),
+    }, signal);
+    return res.json() as Promise<{
+      success: boolean;
+      reconnected?: boolean;
+      reconnectTarget?: string | null;
+      recoveryReason?: string | null;
+    }>;
+  };
+
   const tap = (x: number, y: number, signal?: AbortSignal) => postJson('/api/adb-tap', { x, y }, signal);
 
   const sendBack = (signal?: AbortSignal) => postJson('/api/adb-keyevent', { key: 4 }, signal);
@@ -237,6 +254,9 @@ export const AndroidAgent = () => {
     let loopStrikes = 0;
     let loopState = createLoopState();
     let webModeStartTime: number | null = null;
+    let deviceRecoveryAttempts = 0;
+    let transportFailures = 0;
+    let surveyState = createSurveyState();
 
     const appName = APPS.find(a => a.package === appPackage)?.name || appPackage;
     const playbook = getPlaybook(appPackage);
@@ -248,6 +268,7 @@ export const AndroidAgent = () => {
       loopState = createLoopState();
       loopStrikes = 0;
       consecutiveFailures = 0;
+      surveyState = createSurveyState();
     };
 
     const exitSurvey = async (message: string) => {
@@ -308,6 +329,31 @@ export const AndroidAgent = () => {
 
       while (isRunningRef.current && !signal.aborted) {
         throwIfAborted(signal);
+
+        let health: Awaited<ReturnType<typeof ensureDevice>> | null = null;
+        try {
+          health = await ensureDevice(signal);
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          addLog('error', `ADB device check failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+
+        if (health) {
+          if (health.reconnected) {
+            addLog('info', `Reconnected adb to ${health.reconnectTarget ?? 'device'}.`);
+          }
+          if (!health.success) {
+            deviceRecoveryAttempts += 1;
+            addLog('info', `ADB device not ready (${health.recoveryReason ?? 'unknown'}); attempt ${deviceRecoveryAttempts}/8.`);
+            if (deviceRecoveryAttempts >= 8) {
+              throw new Error(`ADB device unavailable (${health.recoveryReason ?? 'unknown'}). Reconnect the emulator or phone and retry.`);
+            }
+            await sleep(2500, signal);
+            continue;
+          }
+          deviceRecoveryAttempts = 0;
+        }
+
         addLog('info', 'Analyzing current screen state (XML Dump)...');
 
         let rawXml = '';
@@ -459,24 +505,53 @@ export const AndroidAgent = () => {
           }
         }
 
+        surveyState = recordSurveyStep(surveyState, { mode, fingerprint });
+        const budget = checkSurveyBudget(surveyState);
+        if (budget.exceeded) {
+          addLog('error', `Survey budget exceeded: ${budget.reason}`);
+          setStats(prev => ({ ...prev, screenedOut: prev.screenedOut + 1 }));
+          await exitSurvey('Returning to the survey list after the survey budget was exceeded.');
+          continue;
+        }
+
         addLog('info', `Sending context to ${openRouterModel} via OpenRouter...`);
         pushUser(conversationHistory, userText);
         conversationHistory = pruneHistory(conversationHistory, DEFAULT_HISTORY_WINDOW_STEPS);
 
-        const responseRes = await abortableFetch('/api/openrouter/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            system: systemPrompt,
-            max_tokens: 4096,
-            tools: actionTools,
-            tool_choice: { type: 'function', function: { name: 'submit_android_action' } },
-            messages: toChatMessages(conversationHistory),
-          }),
-        }, signal);
-        const response = await responseRes.json();
-        if (!responseRes.ok || !response.success) {
-          throw new Error(response.error?.message || response.error || `OpenRouter request failed (${responseRes.status}).`);
+        let response: any;
+        try {
+          const responseRes = await abortableFetch('/api/openrouter/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              system: systemPrompt,
+              max_tokens: 4096,
+              tools: actionTools,
+              tool_choice: { type: 'function', function: { name: 'submit_android_action' } },
+              messages: toChatMessages(conversationHistory),
+            }),
+          }, signal);
+          response = await responseRes.json();
+          if (!responseRes.ok || !response.success) {
+            throw new Error(response.error?.message || response.error || `OpenRouter request failed (${responseRes.status}).`);
+          }
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          transportFailures += 1;
+          const message = error instanceof Error ? error.message : String(error);
+          addLog('error', `OpenRouter request failed (${transportFailures}/8): ${message}`);
+          if (transportFailures >= 8) {
+            addLog('error', 'Stopping after 8 consecutive model request failures.');
+            showError('The model provider failed 8 times in a row. The agent was stopped.');
+            isRunningRef.current = false;
+            break;
+          }
+          await sleep(2500, signal);
+          continue;
+        }
+        transportFailures = 0;
+        if (response.fallbackUsed || (response.attempts ?? 1) > 1) {
+          addLog('info', `OpenRouter used ${response.model ?? openRouterModel} after ${response.attempts} attempt(s).`);
         }
 
         if (response.usage) {
@@ -620,29 +695,59 @@ export const AndroidAgent = () => {
             const tapPoint = { x: action.x, y: action.y };
             addLog('info', `Sending ADB Tap to ${tapPoint.x}, ${tapPoint.y}...`);
             try {
+              const beforeXml = rawXml;
               await tap(tapPoint.x, tapPoint.y, signal);
               await sleep(500, signal);
 
+              let nextXml = '';
               let nextNodes: UiNode[] = [];
               try {
-                nextNodes = parseUiNodes(await dumpXml(signal));
+                nextXml = await dumpXml(signal);
+                nextNodes = parseUiNodes(nextXml);
               } catch (error) {
                 if (isAbortError(error)) throw error;
               }
-              const nextButton = findNextButton(nextNodes);
 
-              if (nextButton && shouldAutoTapNext(tapPoint, nextButton)) {
-                addLog('info', `Auto-clicking ${nextButton.text || nextButton.desc} at ${nextButton.centerX}, ${nextButton.centerY}`);
-                await tap(nextButton.centerX, nextButton.centerY, signal);
-                actionDetail = `Tapped and then pressed ${nextButton.text || nextButton.desc}.`;
-              } else if (nextButton) {
-                addLog('debug', 'Skipping auto-Next because the tap already targeted the Next control.');
-                actionDetail = 'Tap already targeted the Next control; auto-tap guarded.';
+              const landed = diffScreen(beforeXml, nextXml);
+              if (!landed.changed) {
+                addLog('info', `Tap did not change the screen; retrying once at ${tapPoint.x}, ${tapPoint.y}...`);
+                await sleep(1200, signal);
+                await tap(tapPoint.x, tapPoint.y, signal);
+                await sleep(800, signal);
+                try {
+                  nextXml = await dumpXml(signal);
+                  nextNodes = parseUiNodes(nextXml);
+                } catch (error) {
+                  if (isAbortError(error)) throw error;
+                }
+                const retried = diffScreen(beforeXml, nextXml);
+                if (!retried.changed) {
+                  actionFailed = true;
+                  actionDetail = 'Tap had no visible effect after one retry.';
+                  addLog('error', 'Tap had no visible effect; marking the action failed.');
+                } else {
+                  addLog('info', `Tap landed on retry: ${retried.addedLabels[0] ?? 'screen changed'}`);
+                }
               } else {
-                actionDetail = 'Tap sent; no Next control found yet.';
+                addLog('debug', `Tap changed the screen${landed.addedLabels[0] ? ` (new: ${landed.addedLabels[0]})` : ''}.`);
               }
 
-              consecutiveFailures = 0;
+              if (!actionFailed) {
+                const nextButton = findNextButton(nextNodes);
+
+                if (nextButton && shouldAutoTapNext(tapPoint, nextButton)) {
+                  addLog('info', `Auto-clicking ${nextButton.text || nextButton.desc} at ${nextButton.centerX}, ${nextButton.centerY}`);
+                  await tap(nextButton.centerX, nextButton.centerY, signal);
+                  actionDetail = `Tapped and then pressed ${nextButton.text || nextButton.desc}.`;
+                } else if (nextButton) {
+                  addLog('debug', 'Skipping auto-Next because the tap already targeted the Next control.');
+                  actionDetail = 'Tap already targeted the Next control; auto-tap guarded.';
+                } else {
+                  actionDetail = 'Tap sent; no Next control found yet.';
+                }
+
+                consecutiveFailures = 0;
+              }
             } catch (error) {
               if (isAbortError(error)) throw error;
               addLog('error', `ADB Tap failed: ${error instanceof Error ? error.message : String(error)}`);
