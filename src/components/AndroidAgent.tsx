@@ -338,8 +338,8 @@ export const AndroidAgent = () => {
         addLog('debug', `XML length: ${rawXml.length} | Has <node: ${rawXml.includes('<node')}`);
 
         const hasWebView = rawXml.includes('class="android.webkit.WebView"');
-        const hasRealElements = rawXml.length > 200 && rawXml.includes('<node') && !hasWebView;
-        const mode = hasRealElements ? 'NATIVE' : 'WEB';
+        const hasRealElements = rawXml.length > 200 && rawXml.includes('<node');
+        const mode = !hasRealElements && hasWebView ? 'WEB' : 'NATIVE';
         addLog('info', `Detected Mode: ${mode}`);
 
         let userText = '';
@@ -377,8 +377,6 @@ export const AndroidAgent = () => {
               cdpRetryCount++;
               if (cdpRetryCount >= 1) {
                 addLog('error', `CDP unavailable (${error instanceof Error ? error.message : String(error)}); continuing in native XML mode.`);
-                cdpRetryCount = 0;
-                webModeStartTime = null;
                 setStats(prev => ({ ...prev, cdpFailed: prev.cdpFailed + 1 }));
                 wsUrlRef.current = null;
                 setWsUrl(null);
@@ -387,11 +385,10 @@ export const AndroidAgent = () => {
                 fingerprint = context.fingerprint;
                 setPageText(`// NATIVE UI DETECTED (CDP unavailable, falling back)\n\nScreen: ${screen.width}x${screen.height}\n\n${context.text}`);
                 userText = `Current Mode: NATIVE (CDP unavailable, answer via taps/type)\nGoal: ${goal}\nScreen: ${screen.width}x${screen.height}\n\nInteractive UI nodes (${context.shownCount}/${context.totalCount} shown):\n${context.text}\n\nTap answer buttons; for text fields use action type with x,y and the text to type.`;
-                continue;
               }
               addLog('error', `CDP Setup Failed (Attempt ${cdpRetryCount}/3): ${error instanceof Error ? error.message : String(error)}`);
               await sleep(3000, signal);
-              continue;
+              if (!userText) continue;
             }
           }
 
