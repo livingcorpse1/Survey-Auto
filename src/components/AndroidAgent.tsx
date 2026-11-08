@@ -239,6 +239,8 @@ export const AndroidAgent = () => {
     let loopStrikes = 0;
     let loopState = createLoopState();
     let webModeStartTime: number | null = null;
+    let lastScreenKey: string | null = null;
+    let sameScreenWaits = 0;
 
     const appName = APPS.find(a => a.package === appPackage)?.name || appPackage;
     const playbook = getPlaybook(appPackage);
@@ -344,6 +346,23 @@ export const AndroidAgent = () => {
         } catch (error) {
           if (isAbortError(error)) throw error;
           addLog('error', `XML Dump failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+
+        if (rawXml) {
+          const screenKey = fnv1aHash(rawXml);
+          if (screenKey === lastScreenKey) {
+            sameScreenWaits++;
+            if (sameScreenWaits >= 3) {
+              addLog('error', 'Screen has not changed for 3 dumps; forcing back to the survey list.');
+              await forceBackToList('Screen is stuck — forcing back to the survey list.');
+              lastScreenKey = null;
+              sameScreenWaits = 0;
+              continue;
+            }
+          } else {
+            lastScreenKey = screenKey;
+            sameScreenWaits = 0;
+          }
         }
 
         const isAppOpen = rawXml.includes(`package="${appPackage}"`);
