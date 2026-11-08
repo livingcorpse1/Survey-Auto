@@ -590,6 +590,12 @@ export const AndroidAgent = () => {
         loopState = loopResult.state;
 
         if (action.action === 'done') {
+          if (surveysCompletedThisRun === 0) {
+            addLog('error', `Agent reported done without completing any survey (under 5 min available, only a long one visible).`);
+            showError('Agent finished without completing any survey — only a too-long survey was visible. Check the 5-minute playbook limit or wait for shorter surveys.');
+            isRunningRef.current = false;
+            break;
+          }
           surveysCompletedThisRun++;
           setStats(prev => ({ ...prev, completed: prev.completed + 1 }));
           addLog('success', `Survey ${surveysCompletedThisRun}/${surveyGoal} completed!`);
