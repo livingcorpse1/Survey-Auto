@@ -177,7 +177,10 @@ export function findNextButton(nodes: UiNode[]): UiNode | null {
     return node.enabled;
   });
   if (candidates.length === 0) return null;
-  return candidates.reduce((best, node) => (node.centerY > best.centerY ? node : best), candidates[0]);
+  return candidates.reduce((best, node) => {
+    if (node.centerX <= 0 || node.centerY <= 0) return best;
+    return node.centerY > best.centerY ? node : best;
+  }, candidates[0]);
 }
 
 const CLOSE_LABEL = /^(close|dismiss|cancel|exit|no,?\s*thanks|not\s*now|x|×|✕|✖)$/i;

@@ -52,6 +52,7 @@ WEB MODE (DOM text and HTML provided):
 
 GENERAL RULES:
 - Survey selection, qualification, navigation, and exit behavior are defined by the app playbook below. Follow it exactly.
+- NEVER send action "done" unless a survey was actually completed this session. If you must stop without completing anything, prefer waiting and let the harness timeout decide; returning done counts as completion.
 - If a screen shows a screen-out, quota-full, captcha, or error message, return the appropriate dismissal action (or wait for the app playbook exit behavior).
 - If you need to wait for a loading screen or network request, use action: "wait".
 - If the goal is completely achieved or impossible to progress further, use action: "done".
@@ -77,5 +78,6 @@ APP PLAYBOOK: ${playbook.name} (${playbook.package})
 - Qualification answers: ${playbook.qualification}
 - Navigation: ${playbook.navigation}
 - Exit / screen-out: ${playbook.exit}
-- Tapping rules: never tap an empty area to scroll; only tap survey card containers (resource-id surveys:item:<uuid>) or typed controls. If you land on an unrelated detail page (a game, an offer), tap Back and continue from the survey list.${warnings}`;
+- Tapping rules: never tap an empty area to scroll; only tap survey card containers (resource-id surveys:item:<uuid>) or typed controls. If you land on an unrelated detail page (a game, an offer), tap Back and continue from the survey list.
+- Stuck pages: if a survey wall stays blank for more than 3 waits with no actionable node, treat it as a failed survey, return to the list, and try the next survey. Do not wait on a blank wall indefinitely.${warnings}`;
 }

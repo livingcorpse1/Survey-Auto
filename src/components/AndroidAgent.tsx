@@ -6,7 +6,7 @@ import type { AdbDevice, AgentAction, ChatMessage, LogEntry, ScreenSize, UiNode 
 import { appendLogEntry } from '@/lib/agent/logs';
 import { abortableFetch, isAbortError, sleep, throwIfAborted } from '@/lib/agent/abort';
 import { buildNativeContext, deriveScreenSize, findNextButton, fnv1aHash, parseUiNodes } from '@/lib/agent/xml';
-import { parseWmSize, resolveExitTap } from '@/lib/agent/screen';
+import { parseWmSize, resolveExitTap, findTopLeftBackButton } from '@/lib/agent/screen';
 import { actionKey, createLoopState, updateLoopState } from '@/lib/agent/loop';
 import { shouldAutoTapNext } from '@/lib/agent/taps';
 import { buildSystemPrompt, getPlaybook } from '@/lib/agent/playbooks';
@@ -255,8 +255,17 @@ export const AndroidAgent = () => {
     const exitSurvey = async (message: string) => {
       addLog('info', message);
       try {
-        await sendBack(signal);
-        await sleep(1200, signal);
+        for (let attempt = 0; attempt < 2; attempt++) {
+          await sendBack(signal);
+          await sleep(1200, signal);
+          const nodes = parseUiNodes(await dumpXml(signal));
+          if (!nodes.some(node => node.text.includes('Why are you leaving') || node.desc.includes('Why are you leaving'))) break;
+          const back = findTopLeftBackButton(nodes);
+          if (!back) break;
+          addLog('debug', `Back target: ${back.text || back.resourceId || back.shortClass} -> ${back.centerX}, ${back.centerY}`);
+          await tap(back.centerX, back.centerY, signal);
+          await sleep(1200, signal);
+        }
         const nodes = parseUiNodes(await dumpXml(signal));
         const fallbackScreen = deriveScreenSize(nodes);
         const screen = screenSizeRef.current && screenSizeRef.current.width > 0
