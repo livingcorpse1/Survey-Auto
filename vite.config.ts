@@ -2,11 +2,56 @@ import { defineConfig, loadEnv } from "vite";
 import dyadComponentTagger from "@dyad-sh/react-vite-component-tagger";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
-import { exec, execFile } from "child_process";
+import { spawn } from "child_process";
+import { existsSync } from "fs";
 import util from "util";
 
-const execAsync = util.promisify(exec);
-const execFileAsync = util.promisify(execFile);
+const spawnFile = (
+  file: string,
+  args: string[] = [],
+  options: { windowsHide?: boolean; timeout?: number } = {},
+): Promise<{ stdout: string; stderr: string }> =>
+  new Promise((resolve, reject) => {
+    const child = spawn(file, args, { windowsHide: options.windowsHide ?? true });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = options.timeout
+      ? setTimeout(() => {
+          timedOut = true;
+          child.kill();
+        }, options.timeout)
+      : null;
+    child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on('error', error => {
+      if (timer) clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', code => {
+      if (timer) clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error(`Command timed out: ${file} ${args.join(' ')}`));
+        return;
+      }
+      if (code && code !== 0) {
+        const error: any = new Error(stderr.trim() || `Command failed with exit code ${code}: ${file} ${args.join(' ')}`);
+        error.code = code;
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+
+// util.promisify has no overload for this signature; keep it simple with a typed alias.
+const execFileAsync = spawnFile as unknown as (
+  file: string,
+  args: string[],
+  options?: { windowsHide?: boolean; timeout?: number },
+) => Promise<{ stdout: string; stderr: string }>;
 
 export default defineConfig(({ mode }) => {
   // Load .env variables so we can use them in the server plugin
@@ -406,7 +451,7 @@ export default defineConfig(({ mode }) => {
             const { directory, appPackage } = JSON.parse(body);
             const scrcpyExe = path.join(directory, 'scrcpy.exe');
             
-            const child = exec(`"${scrcpyExe}" --new-display`);
+            const child = spawn(scrcpyExe, ['--new-display'], { detached: true, stdio: 'ignore', windowsHide: true });
             child.unref();
             
             if (appPackage) {
