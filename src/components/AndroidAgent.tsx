@@ -472,14 +472,17 @@ export const AndroidAgent = () => {
         pushUser(conversationHistory, userText);
         conversationHistory = pruneHistory(conversationHistory, DEFAULT_HISTORY_WINDOW_STEPS);
 
+        const useTools = !/crouton-alpha/i.test(openRouterModel);
         const responseRes = await abortableFetch('/api/openrouter/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             system: systemPrompt,
             max_tokens: 4096,
-            tools: actionTools,
-            tool_choice: { type: 'function', function: { name: 'submit_android_action' } },
+            ...(useTools ? {
+              tools: actionTools,
+              tool_choice: { type: 'function', function: { name: 'submit_android_action' } },
+            } : {}),
             messages: toChatMessages(conversationHistory),
           }),
         }, signal);
@@ -529,8 +532,12 @@ export const AndroidAgent = () => {
               : actionCall.function.arguments;
           } else {
             const fencedJson = responseText.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
-            const jsonCandidate = fencedJson || responseText.slice(responseText.indexOf('{'), responseText.lastIndexOf('}') + 1);
-            if (!jsonCandidate || jsonCandidate === responseText && !responseText.includes('{')) throw new Error('No action tool call or JSON object found');
+            const firstBrace = responseText.indexOf('{');
+            const lastBrace = responseText.lastIndexOf('}');
+            const jsonCandidate = fencedJson || (firstBrace >= 0 && lastBrace > firstBrace
+              ? responseText.slice(firstBrace, lastBrace + 1)
+              : '');
+            if (!jsonCandidate) throw new Error('No action tool call or JSON object found');
             action = JSON.parse(jsonCandidate);
           }
           if (!action || !['tap', 'type', 'evaluate', 'wait', 'done'].includes(action.action) || typeof action.observation !== 'string' || typeof action.reason !== 'string') {

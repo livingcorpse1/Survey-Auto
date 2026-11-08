@@ -55,7 +55,7 @@ GENERAL RULES:
 - If a screen shows a screen-out, quota-full, captcha, or error message, return the appropriate dismissal action (or wait for the app playbook exit behavior).
 - If you need to wait for a loading screen or network request, use action: "wait".
 - If the goal is completely achieved or impossible to progress further, use action: "done".
-- Return exactly one action through the submit_android_action tool. Do not return prose or Markdown.
+- Return exactly one JSON object and nothing else. No prose, no markdown, no explanation before or after. Start with { and end with }.
 
 ACTION FORMAT:
 {
