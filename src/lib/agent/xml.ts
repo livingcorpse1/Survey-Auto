@@ -103,7 +103,15 @@ export function isInteractiveNode(node: UiNode): boolean {
 }
 
 export function formatNode(node: UiNode): string {
-  return `<${node.shortClass} bounds="${node.bounds}"${node.text ? ` text="${escapeAttribute(node.text)}"` : ''}${node.desc ? ` desc="${escapeAttribute(node.desc)}"` : ''}${node.resourceId ? ` id="${escapeAttribute(node.resourceId)}"` : ''}${node.clickable ? ' clickable="true"' : ''}${node.checked ? ' checked="true"' : ''}${node.scrollable ? ' scrollable="true"' : ''} />`;
+  const bits: string[] = [`<${node.shortClass} bounds="${node.bounds}"`];
+  if (node.text) bits.push(`text="${escapeAttribute(node.text)}"`);
+  if (node.desc) bits.push(`desc="${escapeAttribute(node.desc)}"`);
+  if (node.resourceId) bits.push(`id="${escapeAttribute(node.resourceId)}"`);
+  if (node.clickable) bits.push('clickable="true"');
+  if (node.checked) bits.push('checked="true"');
+  if (node.scrollable) bits.push('scrollable="true"');
+  const center = ` center=(${node.centerX},${node.centerY})`;
+  return `${bits.join(' ')}${center} />`;
 }
 
 export function selectNodesForPrompt(nodes: UiNode[], maxNodes: number = DEFAULT_MAX_INTERACTIVE_NODES): UiNode[] {

@@ -37,7 +37,7 @@ const SHARED_PROMPT = `You are a hybrid automated agent controlling an Android d
 
 NATIVE MODE (UI XML provided):
 - Analyze the interactive UI nodes and choose the element that progresses the goal.
-- To click an element, calculate the center (x, y) of its bounds="[x1,y1][x2,y2]" and return those coordinates.
+- To click an element, use the printed center coordinates (cx,cy) for the tap. Never tap the area below a card to "scroll" — that often opens unrelated detail pages (games, offers). Only tap card containers to start surveys.
 - Only return tap actions with non-negative integer coordinates that lie inside the target bounds.
 - Choose the app-specific Next/Submit control from the XML. Do not guess its position.
 - For text-input questions (single-line fields for age/number/year postcodes), return action "type" with x,y of the field center and the exact text to type. Tap the field first if it is not focused. Type the answer, then tap Next/Submit.
@@ -76,5 +76,6 @@ APP PLAYBOOK: ${playbook.name} (${playbook.package})
 - Survey selection: ${playbook.selection}
 - Qualification answers: ${playbook.qualification}
 - Navigation: ${playbook.navigation}
-- Exit / screen-out: ${playbook.exit}${warnings}`;
+- Exit / screen-out: ${playbook.exit}
+- Tapping rules: never tap an empty area to scroll; only tap survey card containers (resource-id surveys:item:<uuid>) or typed controls. If you land on an unrelated detail page (a game, an offer), tap Back and continue from the survey list.${warnings}`;
 }
