@@ -47,6 +47,15 @@ export function resolveExitTap(nodes: UiNode[], screen: ScreenSize): ExitTap {
   return { x: 541, y: 1036, derivedFrom: 'screen-center', target: 'default' };
 }
 
+/** Back arrow shown at the top-left of a detail/wall page when no close label is available. */
+export function findTopLeftBackButton(nodes: UiNode[]): UiNode | null {
+  const candidates = nodes.filter(node =>
+    node.clickable && node.centerX >= 0 && node.centerY >= 0 && node.centerX < 300 && node.centerY < 220,
+  );
+  if (candidates.length === 0) return null;
+  return candidates.reduce((best, node) => (node.centerY < best.centerY ? node : best), candidates[0]);
+}
+
 export function screenCenter(screen: ScreenSize): Point {
   return screen.width > 0 && screen.height > 0
     ? { x: Math.round(screen.width / 2), y: Math.round(screen.height / 2) }
