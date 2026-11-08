@@ -241,6 +241,7 @@ export const AndroidAgent = () => {
     let webModeStartTime: number | null = null;
     let lastScreenKey: string | null = null;
     let sameScreenWaits = 0;
+    let noProgressKeys = new Set<string>();
 
     const appName = APPS.find(a => a.package === appPackage)?.name || appPackage;
     const playbook = getPlaybook(appPackage);
@@ -252,6 +253,7 @@ export const AndroidAgent = () => {
       loopState = createLoopState();
       loopStrikes = 0;
       consecutiveFailures = 0;
+      noProgressKeys = new Set();
     };
 
     const forceBackToList = async (message: string) => {
@@ -352,7 +354,8 @@ export const AndroidAgent = () => {
           const screenKey = fnv1aHash(rawXml);
           if (screenKey === lastScreenKey) {
             sameScreenWaits++;
-            if (sameScreenWaits >= 3) {
+            if (sameScreenWaits >= 3 && !noProgressKeys.has(screenKey)) {
+              noProgressKeys.add(screenKey);
               addLog('error', 'Screen has not changed for 3 dumps; forcing back to the survey list.');
               await forceBackToList('Screen is stuck — forcing back to the survey list.');
               lastScreenKey = null;
