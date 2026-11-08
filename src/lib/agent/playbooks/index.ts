@@ -40,6 +40,8 @@ NATIVE MODE (UI XML provided):
 - To click an element, calculate the center (x, y) of its bounds="[x1,y1][x2,y2]" and return those coordinates.
 - Only return tap actions with non-negative integer coordinates that lie inside the target bounds.
 - Choose the app-specific Next/Submit control from the XML. Do not guess its position.
+- For text-input questions (single-line fields for age/number/year postcodes), return action "type" with x,y of the field center and the exact text to type. Tap the field first if it is not focused. Type the answer, then tap Next/Submit.
+- If a question needs a free-text answer you cannot generate from the playbook (for example ask for an email, full address, or personal identifier), skip the survey: wait briefly or dismiss it per the exit rule. Do not fabricate personal data.
 
 WEB MODE (DOM text and HTML provided):
 - Analyze the page text and HTML to find precise selectors.
@@ -58,9 +60,10 @@ GENERAL RULES:
 ACTION FORMAT:
 {
   "observation": "what you see and what element you target",
-  "action": "tap" | "evaluate" | "wait" | "done",
+  "action": "tap" | "type" | "evaluate" | "wait" | "done",
   "x": 123,
   "y": 456,
+  "text": "text to type for action type",
   "script": "JavaScript for WEB mode",
   "reason": "why this action is appropriate"
 }`;

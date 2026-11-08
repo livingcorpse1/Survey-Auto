@@ -2,11 +2,56 @@ import { defineConfig, loadEnv } from "vite";
 import dyadComponentTagger from "@dyad-sh/react-vite-component-tagger";
 import react from "@vitejs/plugin-react-swc";
 import path from "path";
-import { exec, execFile } from "child_process";
+import { spawn } from "child_process";
+import { existsSync } from "fs";
 import util from "util";
 
-const execAsync = util.promisify(exec);
-const execFileAsync = util.promisify(execFile);
+const spawnFile = (
+  file: string,
+  args: string[] = [],
+  options: { windowsHide?: boolean; timeout?: number } = {},
+): Promise<{ stdout: string; stderr: string }> =>
+  new Promise((resolve, reject) => {
+    const child = spawn(file, args, { windowsHide: options.windowsHide ?? true });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = options.timeout
+      ? setTimeout(() => {
+          timedOut = true;
+          child.kill();
+        }, options.timeout)
+      : null;
+    child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on('error', error => {
+      if (timer) clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', code => {
+      if (timer) clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error(`Command timed out: ${file} ${args.join(' ')}`));
+        return;
+      }
+      if (code && code !== 0) {
+        const error: any = new Error(stderr.trim() || `Command failed with exit code ${code}: ${file} ${args.join(' ')}`);
+        error.code = code;
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+
+// util.promisify has no overload for this signature; keep it simple with a typed alias.
+const execFileAsync = spawnFile as unknown as (
+  file: string,
+  args: string[],
+  options?: { windowsHide?: boolean; timeout?: number },
+) => Promise<{ stdout: string; stderr: string }>;
 
 export default defineConfig(({ mode }) => {
   // Load .env variables so we can use them in the server plugin
@@ -38,6 +83,8 @@ export default defineConfig(({ mode }) => {
     const serial = await resolveSerial();
     return execFileAsync(ADB, ['-s', serial, ...args], { windowsHide: true });
   };
+
+  const runAdbRaw = async (args: string[]) => execFileAsync(ADB, args, { windowsHide: true });
 
   const cdpPlugin = () => ({
     name: 'cdp-plugin',
@@ -314,6 +361,31 @@ export default defineConfig(({ mode }) => {
         });
       });
 
+      // 4b. Type Text Endpoint (for text-input survey questions)
+      server.middlewares.use('/api/adb-type-text', (req: any, res: any) => {
+        if (req.method !== 'POST') return req.next();
+        let body = '';
+        req.on('data', (chunk: any) => { body += chunk.toString(); });
+        req.on('end', async () => {
+          res.setHeader('Content-Type', 'application/json');
+          try {
+            const { text } = JSON.parse(body);
+            const value = String(text ?? '').replace(/\s+/g, '');
+            if (!value) throw new Error('Text is required.');
+            if (value.length > 256) throw new Error('Text too long.');
+            if (!/^[A-Za-z0-9._@+\-]*$/.test(value)) throw new Error('Text contains characters adb input cannot type safely.');
+            console.log(`[ADB Type] Typing ${value.length} chars`);
+            const serial = await resolveSerial();
+            await runAdbRaw(['-s', serial, 'shell', 'input', 'text', value]);
+            res.end(JSON.stringify({ success: true }));
+          } catch (e: any) {
+            console.error(e);
+            res.statusCode = 500;
+            res.end(JSON.stringify({ success: false, error: e.message }));
+          }
+        });
+      });
+
       // 5. Dump XML Endpoint
       server.middlewares.use('/api/dump-xml', (req: any, res: any) => {
         if (req.method !== 'POST') return req.next();
@@ -379,7 +451,7 @@ export default defineConfig(({ mode }) => {
             const { directory, appPackage } = JSON.parse(body);
             const scrcpyExe = path.join(directory, 'scrcpy.exe');
             
-            const child = exec(`"${scrcpyExe}" --new-display`);
+            const child = spawn(scrcpyExe, ['--new-display'], { detached: true, stdio: 'ignore', windowsHide: true });
             child.unref();
             
             if (appPackage) {
